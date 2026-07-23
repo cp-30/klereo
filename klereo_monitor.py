@@ -130,6 +130,23 @@ def kv_set(k, v):
                   "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, json.dumps(v)))
 
 
+# Config/secrets: a value edited in the web UI is stored in the DB (kv, on the
+# VM only) and takes priority over the environment variable of the same name.
+CFG_KEYS = ("KLEREO_LOGIN", "KLEREO_PASSWORD", "KLEREO_POOL_ID",
+            "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "ALERT_TO", "ALERT_FROM", "SMTP_PASS")
+
+
+def cfg_get(key):
+    v = kv_get("cfg_" + key)
+    if isinstance(v, str) and v != "":
+        return v
+    return os.environ.get(key)
+
+
+def cfg_set(key, value):
+    kv_set("cfg_" + key, value)
+
+
 # --------------------------------------------------------------------------
 # Klereo client (read-only)
 # --------------------------------------------------------------------------
@@ -212,13 +229,13 @@ def _clean(s):
 
 
 def send_email(subject, body):
-    host = _clean(os.environ.get("SMTP_HOST"))
-    user = _clean(os.environ.get("SMTP_USER"))
-    to   = _clean(os.environ.get("ALERT_TO"))
-    frm  = _clean(os.environ.get("ALERT_FROM") or user)
+    host = _clean(cfg_get("SMTP_HOST"))
+    user = _clean(cfg_get("SMTP_USER"))
+    to   = _clean(cfg_get("ALERT_TO"))
+    frm  = _clean(cfg_get("ALERT_FROM") or user)
     # Gmail app passwords are 16 chars with no spaces; remove ALL whitespace
     # (incl. the non-breaking space Google's UI sometimes inserts).
-    pw = re.sub(r"\s+", "", (os.environ.get("SMTP_PASS") or "").replace("\xa0", " "))
+    pw = re.sub(r"\s+", "", (cfg_get("SMTP_PASS") or "").replace("\xa0", " "))
     if not all([host, user, pw, to]):
         print("[email] not configured; skipping"); return False
     msg = EmailMessage()
@@ -226,7 +243,7 @@ def send_email(subject, body):
     msg["From"] = frm
     msg["To"] = to
     msg.set_content(body)
-    with smtplib.SMTP(host, int(_clean(os.environ.get("SMTP_PORT")) or "587"),
+    with smtplib.SMTP(host, int(_clean(cfg_get("SMTP_PORT")) or "587"),
                       timeout=HTTP_TIMEOUT) as s:
         s.starttls(); s.login(user, pw); s.send_message(msg)
     print(f"[email] sent to {to}")
@@ -234,11 +251,11 @@ def send_email(subject, body):
 
 
 def poll_once():
-    login = os.environ.get("KLEREO_LOGIN"); password = os.environ.get("KLEREO_PASSWORD")
+    login = cfg_get("KLEREO_LOGIN"); password = cfg_get("KLEREO_PASSWORD")
     if not login or not password:
         raise KlereoError("KLEREO_LOGIN / KLEREO_PASSWORD not set")
     k = Klereo(); k.login(login, password)
-    pid = os.environ.get("KLEREO_POOL_ID")
+    pid = cfg_get("KLEREO_POOL_ID")
     if not pid:
         ids = k.pool_ids()
         if len(ids) != 1:
@@ -409,9 +426,17 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
  .setrow{display:flex;justify-content:space-between;align-items:center;margin:10px 0}
  .setrow label{margin:0} .setrow input{width:70px;text-align:right} .setrow .u{color:#94a3b8;margin-left:6px}
  .err{background:#7f1d1d;color:#fecaca;padding:8px 12px;border-radius:8px;margin-top:12px;font-size:13px}
+ .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(80px);background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:12px 18px;border-radius:10px;font-size:14px;box-shadow:0 8px 24px rgba(0,0,0,.45);opacity:0;transition:all .25s;z-index:30;max-width:90%;text-align:center}
+ .toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+ .toast.ok{border-color:#16a34a} .toast.bad{border-color:#dc2626}
+ .seg{display:inline-flex;background:#0f172a;border:1px solid #334155;border-radius:8px;overflow:hidden}
+ .seg button{background:transparent;color:#cbd5e1;border:0;padding:6px 12px;font-size:13px;cursor:pointer}
+ .seg button.active{background:#2563eb;color:#fff}
 </style></head><body>
  <div id="ptr" style="position:fixed;top:0;left:0;right:0;text-align:center;padding:8px;color:#94a3b8;font-size:13px;transform:translateY(-40px);transition:transform .15s;z-index:6">&#8595; pull to refresh</div>
+ <div id="toast" class="toast"></div>
  <div class="wrap">
+ <a href="/config" class="ghost" title="Settings" style="position:fixed;top:10px;right:58px;z-index:5;font-size:18px;line-height:1;padding:8px 12px;text-decoration:none">&#9881;</a>
  <button id="refbtn" class="ghost" title="Refresh" style="position:fixed;top:10px;right:10px;z-index:5;font-size:18px;line-height:1;padding:8px 12px" onclick="refresh()">&#8635;</button>
  <h1 id="title">Klereo Monitor</h1>
  <div class="sub" id="sub">loading...</div>
@@ -429,23 +454,27 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
      &nbsp; <span class="unit">/ <span id="rem">-</span> L left of <span id="bottle">-</span> L</span></div>
   <div class="bar"><div id="barfill" style="width:0%"></div></div>
   <div class="sub" id="bottleinfo" style="margin-top:10px"></div>
-  <form method="post" action="/new-bottle" onsubmit="return confirm('Reset the baseline to now? Do this only when you have fitted a NEW bottle.')">
-     <button type="submit">New bottle fitted (reset baseline)</button>
-  </form>
- </div>
- <div class="panel"><canvas id="chart" height="120"></canvas></div>
- <div class="panel">
-  <form method="post" action="/settings">
-    <div class="setrow"><label>Bottle size</label><span><input name="bottle_l" id="bo" type="number" step="1"><span class="u">L</span></span></div>
-    <div class="setrow"><label>1st alert at</label><span><input name="warn_remaining_l" id="warn_in" type="number" step="0.5"><span class="u">L left</span></span></div>
-    <div class="setrow"><label>Final alert at</label><span><input name="final_remaining_l" id="final_in" type="number" step="0.1"><span class="u">L left</span></span></div>
-    <div class="setrow"><label>Check every</label><span><input name="poll_minutes" id="pm" type="number" step="1" min="1"><span class="u">min</span></span></div>
-    <button type="submit" style="width:100%;margin-top:6px">Save settings</button>
-  </form>
-  <div class="row">
-    <form method="post" action="/poll-now"><button class="ghost" type="submit">Poll now</button></form>
-    <form method="post" action="/test-email"><button class="ghost" type="submit">Send test email</button></form>
+  <button type="button" onclick="newBottle()">New bottle fitted</button>
+  <div style="margin-top:8px;font-size:13px;color:#cbd5e1">
+    <label><input type="checkbox" id="backdate" onchange="document.getElementById('bdwrap').style.display=this.checked?'inline-block':'none'"> fitted earlier?</label>
+    <span id="bdwrap" style="display:none;margin-left:8px"><input type="datetime-local" id="bdtime" style="background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:5px;font-size:13px"></span>
   </div>
+ </div>
+ <div class="panel">
+  <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase;margin-bottom:6px">pH &amp; Redox</div>
+  <canvas id="chart" height="120"></canvas>
+ </div>
+ <div class="panel">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Chlorine used</div>
+    <div class="seg">
+      <button id="segDay" class="active" type="button" onclick="setUsage('day')">Day</button>
+      <button id="segWeek" type="button" onclick="setUsage('week')">Week</button>
+      <button id="segMonth" type="button" onclick="setUsage('month')">Month</button>
+    </div>
+  </div>
+  <canvas id="usageChart" height="120"></canvas>
+  <div class="sub" id="usageSummary" style="margin-top:8px"></div>
  </div>
 </div>
 <script>
@@ -463,10 +492,6 @@ async function load(){
  if(r.filtration==null){f.textContent='-';f.className='val';}
  else{f.textContent=r.filtration? 'ON':'OFF'; f.className='val '+(r.filtration?'on':'off');}
  document.getElementById('bottle').textContent=(s.bottle_l==null?'-':s.bottle_l);
- document.getElementById('bo').value=s.bottle_l;
- document.getElementById('warn_in').value=s.warn_remaining_l;
- document.getElementById('final_in').value=s.final_remaining_l;
- document.getElementById('pm').value=s.poll_minutes;
  if(r.used_l!=null){
    const used=r.used_l, bottle=s.bottle_l||20, rem=Math.max(bottle-used,0);
    document.getElementById('used').textContent=used.toFixed(1);
@@ -480,6 +505,71 @@ async function load(){
  }
  const h = await (await fetch('/api/history')).json();
  drawChart(h, r);
+ loadUsage();
+}
+function showToast(msg, ok){
+ const t=document.getElementById('toast');
+ t.textContent=msg; t.className='toast show '+(ok===false?'bad':'ok');
+ clearTimeout(window._tt); window._tt=setTimeout(()=>{t.className='toast';},3500);
+}
+async function postAction(url, body){
+ const opt={method:'POST'};
+ if(body){opt.headers={'Content-Type':'application/x-www-form-urlencoded'}; opt.body=body;}
+ try{ const r=await fetch(url,opt); return await r.json(); }
+ catch(e){ return {ok:false, message:'Network error'}; }
+}
+async function newBottle(){
+ let body='';
+ const bd=document.getElementById('backdate');
+ if(bd && bd.checked){
+   const t=document.getElementById('bdtime').value;
+   if(!t){ showToast('Pick when you fitted it, or untick "fitted earlier?"', false); return; }
+   if(!confirm('Record the new bottle as fitted on '+t.replace('T',' ')+'?')) return;
+   body='at_ms='+new Date(t).getTime();
+ } else {
+   if(!confirm('Reset tracking to now? Only do this when you have fitted a NEW bottle.')) return;
+ }
+ const r=await postAction('/new-bottle', body); showToast(r.message, r.ok);
+ if(bd && bd.checked){ bd.checked=false; document.getElementById('bdwrap').style.display='none'; }
+ load();
+}
+let usageChart, usagePeriod='day', usageData=[];
+async function loadUsage(){
+ try{ usageData = await (await fetch('/api/usage')).json(); }catch(e){ usageData=[]; }
+ drawUsage();
+}
+function setUsage(p){
+ usagePeriod=p;
+ ['Day','Week','Month'].forEach(x=>document.getElementById('seg'+x).classList.toggle('active', x.toLowerCase()===p));
+ drawUsage();
+}
+function bucketUsage(){
+ if(usagePeriod==='day') return usageData.slice(-30).map(d=>({label:d.date.slice(5), litres:d.litres}));
+ const map={};
+ usageData.forEach(d=>{
+   let key;
+   if(usagePeriod==='month'){ key=d.date.slice(0,7); }
+   else { const dt=new Date(d.date+'T00:00:00'); const off=(dt.getDay()+6)%7;
+          const mon=new Date(dt); mon.setDate(dt.getDate()-off); key=mon.toISOString().slice(0,10); }
+   map[key]=(map[key]||0)+d.litres;
+ });
+ const keys=Object.keys(map).sort();
+ const sliced = usagePeriod==='month'? keys.slice(-12) : keys.slice(-16);
+ return sliced.map(k=>({label: usagePeriod==='week'? k.slice(5) : k, litres:+map[k].toFixed(2)}));
+}
+function drawUsage(){
+ const b=bucketUsage();
+ const total=b.reduce((s,x)=>s+x.litres,0);
+ document.getElementById('usageSummary').textContent = b.length
+   ? ('total shown: '+total.toFixed(1)+' L   |   latest '+usagePeriod+': '+b[b.length-1].litres.toFixed(2)+' L')
+   : 'No usage data yet - this builds up as the monitor runs (needs 2+ days).';
+ const ctx=document.getElementById('usageChart');
+ const data={labels:b.map(x=>x.label), datasets:[{label:'L used', data:b.map(x=>x.litres), backgroundColor:'#f59e0b', borderRadius:4}]};
+ const opts={responsive:true, plugins:{legend:{display:false}},
+   scales:{y:{beginAtZero:true,title:{display:true,text:'L'},grid:{color:'#334155'}},
+           x:{ticks:{maxTicksLimit:10,color:'#94a3b8'},grid:{display:false}}}};
+ if(usageChart) usageChart.destroy();
+ usageChart=new Chart(ctx,{type:'bar',data,options:opts});
 }
 let chart;
 function drawChart(h, r){
@@ -552,6 +642,93 @@ button{width:100%;background:#2563eb;color:#fff;border:0;border-radius:8px;paddi
 </form></body></html>""")
 
 
+def config_html():
+    import html as _html
+    def val(k):
+        v = cfg_get(k)
+        return _html.escape("" if v is None else str(v), quote=True)
+    bottle = kv_get("bottle_l", DEF_BOTTLE)
+    warn   = kv_get("warn_remaining_l", 5.0)
+    final  = kv_get("final_remaining_l", 0.5)
+    poll   = kv_get("poll_minutes", POLL_MINUTES)
+    port   = val("SMTP_PORT") or "587"
+    head = ("""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Pool">
+<meta name="theme-color" content="#0f172a"><title>Pool - Settings</title>
+<style>
+body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
+.wrap{max-width:560px;margin:0 auto;padding:18px}
+h1{font-size:20px;margin:8px 0 14px}
+.panel{background:#1e293b;border-radius:12px;padding:16px;margin-top:14px}
+.lbl2{color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px}
+.setrow{display:flex;justify-content:space-between;align-items:center;margin:10px 0;gap:10px}
+.setrow label{font-size:14px;color:#cbd5e1;white-space:nowrap}
+input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:8px;font-size:14px}
+.setrow input{flex:1;min-width:0;text-align:right} .u{color:#94a3b8;margin-left:6px}
+button{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:11px 14px;font-size:14px;cursor:pointer}
+button.ghost{background:#334155;margin-top:10px}
+a{color:#93c5fd}
+.hint{color:#94a3b8;font-size:12px;margin-top:6px}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(80px);background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:12px 18px;border-radius:10px;font-size:14px;box-shadow:0 8px 24px rgba(0,0,0,.45);opacity:0;transition:all .25s;z-index:30;max-width:90%;text-align:center}
+.toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+.toast.ok{border-color:#16a34a} .toast.bad{border-color:#dc2626}
+</style></head><body>
+<div id="toast" class="toast"></div>
+<div class="wrap">
+<a href="/">&larr; Dashboard</a>
+<h1>Settings</h1>""")
+    fields = f"""
+<div class="panel"><div class="lbl2">Alerts &amp; polling</div>
+ <div class="setrow"><label>Bottle size</label><span><input id="bottle_l" type="number" step="1" value="{bottle}"><span class="u">L</span></span></div>
+ <div class="setrow"><label>1st alert at</label><span><input id="warn" type="number" step="0.5" value="{warn}"><span class="u">L left</span></span></div>
+ <div class="setrow"><label>Final alert at</label><span><input id="final" type="number" step="0.1" value="{final}"><span class="u">L left</span></span></div>
+ <div class="setrow"><label>Check every</label><span><input id="poll" type="number" step="1" min="1" value="{poll}"><span class="u">min</span></span></div>
+</div>
+<div class="panel"><div class="lbl2">Klereo account</div>
+ <div class="setrow"><label>Login</label><input id="KLEREO_LOGIN" type="text" value="{val('KLEREO_LOGIN')}"></div>
+ <div class="setrow"><label>Pool ID</label><input id="KLEREO_POOL_ID" type="text" value="{val('KLEREO_POOL_ID')}"></div>
+ <div class="setrow"><label>Password</label><input id="KLEREO_PASSWORD" type="password" placeholder="unchanged" autocomplete="off"></div>
+ <div class="hint">Leave password blank to keep the current one.</div>
+</div>
+<div class="panel"><div class="lbl2">Email alerts</div>
+ <div class="setrow"><label>SMTP host</label><input id="SMTP_HOST" type="text" value="{val('SMTP_HOST')}"></div>
+ <div class="setrow"><label>SMTP port</label><input id="SMTP_PORT" type="text" value="{port}"></div>
+ <div class="setrow"><label>SMTP user</label><input id="SMTP_USER" type="text" value="{val('SMTP_USER')}"></div>
+ <div class="setrow"><label>Alerts to</label><input id="ALERT_TO" type="text" value="{val('ALERT_TO')}"></div>
+ <div class="setrow"><label>App password</label><input id="SMTP_PASS" type="password" placeholder="unchanged" autocomplete="off"></div>
+ <div class="hint">Gmail app password (16 chars). Leave blank to keep the current one.</div>
+ <button class="ghost" type="button" onclick="testEmail()">Send test email</button>
+</div>
+<button type="button" onclick="saveConfig()" style="width:100%;margin-top:14px">Save settings</button>
+<div class="hint" style="text-align:center;margin-top:8px">Saved on the server; secrets are never shown back here.</div>
+"""
+    tail = ("""
+</div><script>
+function showToast(msg, ok){
+ const t=document.getElementById('toast');
+ t.textContent=msg; t.className='toast show '+(ok===false?'bad':'ok');
+ clearTimeout(window._tt); window._tt=setTimeout(()=>{t.className='toast';},3500);
+}
+async function postAction(url, body){
+ const opt={method:'POST'};
+ if(body){opt.headers={'Content-Type':'application/x-www-form-urlencoded'}; opt.body=body;}
+ try{ const r=await fetch(url,opt); return await r.json(); }catch(e){ return {ok:false,message:'Network error'}; }
+}
+async function testEmail(){ showToast('Sending test email...'); const r=await postAction('/test-email'); showToast(r.message, r.ok); }
+async function saveConfig(){
+ const ids=['bottle_l','warn','final','poll','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS'];
+ const p=new URLSearchParams();
+ ids.forEach(id=>{const el=document.getElementById(id); if(el && el.value!=='') p.append(id, el.value);});
+ const r=await postAction('/config', p.toString()); showToast(r.message, r.ok);
+ ['KLEREO_PASSWORD','SMTP_PASS'].forEach(id=>document.getElementById(id).value='');
+}
+</script></body></html>""")
+    return head + fields + tail
+
+
 def status_payload():
     return {
         "reading": kv_get("last_reading"),
@@ -575,19 +752,68 @@ def history_payload():
     return list(reversed([dict(r) for r in rows]))
 
 
-def do_new_bottle():
-    r = kv_get("last_reading") or {}
-    total = r.get("total_time")
-    if total is None:
-        with _lock:
-            r = poll_once()
+def usage_payload():
+    """Chlorine used per calendar day, derived from the lifetime odometer.
+    litres(reading) = total_time * debit / 36000; daily use = day-end minus
+    previous day-end. Returns [{date, litres}] oldest->newest (last 120 days)."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT date(ts) AS d, MAX(total_time) AS tt, "
+            "       (SELECT debit FROM readings r2 WHERE date(r2.ts)=date(r1.ts) "
+            "        AND debit IS NOT NULL ORDER BY ts DESC LIMIT 1) AS debit "
+            "FROM readings r1 WHERE total_time IS NOT NULL "
+            "GROUP BY d ORDER BY d").fetchall()
+    out, prev = [], None
+    for r in rows:
+        tt, debit = r["tt"], r["debit"]
+        if tt is None or debit is None:
+            continue
+        cum = tt * debit / 36000.0
+        if prev is not None:
+            out.append({"date": r["d"], "litres": round(max(cum - prev, 0), 3)})
+        prev = cum
+    return out[-120:]
+
+
+def do_new_bottle(at_ms=None):
+    """Register a new bottle. at_ms (epoch ms) backdates the baseline to the
+    odometer reading nearest that time; None means 'now'."""
+    if at_ms is None:
+        r = kv_get("last_reading") or {}
         total = r.get("total_time")
+        if total is None:
+            with _lock:
+                r = poll_once()
+            total = r.get("total_time")
+        debit = r.get("debit")
+        fitted = now_iso()
+    else:
+        target = at_ms / 1000.0
+        with db() as c:
+            rows = c.execute("SELECT ts,total_time,debit FROM readings "
+                             "WHERE total_time IS NOT NULL ORDER BY ts").fetchall()
+        chosen = None
+        for row in rows:
+            try:
+                ep = datetime.fromisoformat(row["ts"]).timestamp()
+            except ValueError:
+                continue
+            if ep <= target:
+                chosen = row
+            else:
+                break
+        if chosen is None:
+            chosen = rows[0] if rows else None
+        if chosen is None:               # no history at all -> fall back to now
+            return do_new_bottle(None)
+        total = chosen["total_time"]; debit = chosen["debit"]
+        fitted = datetime.fromtimestamp(target).astimezone().isoformat(timespec="minutes")
     kv_set("baseline_total_time", total)
-    kv_set("debit_at_baseline", r.get("debit"))
-    kv_set("bottle_fitted_at", now_iso())
+    kv_set("debit_at_baseline", debit)
+    kv_set("bottle_fitted_at", fitted)
     kv_set("notified_warn", 0)
     kv_set("notified_final", 0)
-    # Re-poll so the dashboard immediately shows ~0 L used against the new baseline
+    # Re-poll so the dashboard immediately reflects usage against the new baseline
     try:
         with _lock:
             poll_once()
@@ -669,10 +895,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._redirect("/login")
         if path == "/":
             self._send(200, PAGE)
+        elif path == "/config":
+            self._send(200, config_html())
         elif path == "/api/status":
             self._json(status_payload())
         elif path == "/api/history":
             self._json(history_payload())
+        elif path == "/api/usage":
+            self._json(usage_payload())
         else:
             self._send(404, "not found")
 
@@ -693,38 +923,38 @@ class Handler(BaseHTTPRequestHandler):
             return self._auth_challenge()
         try:
             if path == "/new-bottle":
-                do_new_bottle(); self._redirect("/")
-            elif path == "/settings":
-                kv_set("bottle_l", float(form["bottle_l"]))
-                kv_set("warn_remaining_l", max(0.0, float(form["warn_remaining_l"])))
-                kv_set("final_remaining_l", max(0.0, float(form["final_remaining_l"])))
-                if form.get("poll_minutes"):
-                    kv_set("poll_minutes", max(1.0, float(form["poll_minutes"])))
-                self._redirect("/")
+                at = form.get("at_ms")
+                do_new_bottle(int(at) if at else None)
+                self._json({"ok": True, "message":
+                            "New bottle recorded" + (" (backdated)." if at else ".")})
+            elif path == "/config":
+                if form.get("bottle_l"): kv_set("bottle_l", float(form["bottle_l"]))
+                if form.get("warn"): kv_set("warn_remaining_l", max(0.0, float(form["warn"])))
+                if form.get("final"): kv_set("final_remaining_l", max(0.0, float(form["final"])))
+                if form.get("poll"): kv_set("poll_minutes", max(1.0, float(form["poll"])))
+                for key in CFG_KEYS:
+                    if key in form and form[key].strip() != "":
+                        cfg_set(key, form[key].strip())
+                self._json({"ok": True, "message": "Settings saved."})
             elif path == "/poll-now":
                 with _lock:
                     poll_once()
-                self._redirect("/")
+                self._json({"ok": True, "message": "Updated from the controller."})
             elif path == "/test-email":
                 try:
                     ok = send_email("Klereo Monitor: test email",
                                     "This is a test from your Klereo Monitor. "
                                     "If you received it, email alerts are working.")
                     msg = ("Test email sent - check your inbox (and spam)." if ok
-                           else "Email is NOT configured. Set SMTP_HOST / SMTP_USER / "
-                                "SMTP_PASS / ALERT_TO in klereo.env, then restart.")
+                           else "Email is NOT configured (SMTP_* missing in klereo.env).")
+                    self._json({"ok": bool(ok), "message": msg})
                 except Exception as e:
-                    msg = f"Email FAILED: {e}"
-                self._send(200, "<!doctype html><meta charset=utf-8>"
-                           "<body style='font-family:sans-serif;background:#0f172a;"
-                           "color:#e2e8f0;padding:24px'>"
-                           f"<p>{msg}</p><p><a style='color:#93c5fd' href='/'>&larr; "
-                           "Back to dashboard</a></p>")
+                    self._json({"ok": False, "message": f"Email failed: {e}"})
             else:
                 self._send(404, "not found")
         except Exception as e:
             kv_set("last_error", f"{now_iso()}: {e}")
-            self._send(500, f"error: {e}")
+            self._json({"ok": False, "message": f"Error: {e}"})
 
 
 def main():
