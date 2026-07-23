@@ -43,6 +43,7 @@ Environment variables
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -109,10 +110,12 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS readings (
             ts TEXT, total_time REAL, debit REAL, ph REAL, orp REAL,
             temp REAL, salt REAL, filtration INTEGER, used_l REAL)""")
-    if kv_get("threshold_l")  is None: kv_set("threshold_l", DEF_THRESHOLD)
-    if kv_get("bottle_l")     is None: kv_set("bottle_l", DEF_BOTTLE)
-    if kv_get("notified")     is None: kv_set("notified", 0)
-    if kv_get("poll_minutes") is None: kv_set("poll_minutes", POLL_MINUTES)
+    if kv_get("bottle_l")         is None: kv_set("bottle_l", DEF_BOTTLE)
+    if kv_get("poll_minutes")     is None: kv_set("poll_minutes", POLL_MINUTES)
+    if kv_get("warn_remaining_l") is None: kv_set("warn_remaining_l", 5.0)
+    if kv_get("final_remaining_l") is None: kv_set("final_remaining_l", 0.5)
+    if kv_get("notified_warn")    is None: kv_set("notified_warn", 0)
+    if kv_get("notified_final")   is None: kv_set("notified_final", 0)
 
 
 def kv_get(k, default=None):
@@ -191,20 +194,40 @@ def out_status(pool, index):
     return None
 
 
+def probe_seuils(pool, ptype):
+    """Return (seuilMin, seuilMax) - the system's regulation limits for a probe."""
+    for p in pool.get("probes") or []:
+        if p.get("type") == ptype:
+            return p.get("seuilMin"), p.get("seuilMax")
+    return None, None
+
+
 # --------------------------------------------------------------------------
 # Poll + alert
 # --------------------------------------------------------------------------
+def _clean(s):
+    """Trim spaces/newlines and strip non-breaking spaces (\\xa0) that sneak in
+    when pasting a Gmail app password from Google's UI."""
+    return (s or "").replace("\xa0", " ").strip()
+
+
 def send_email(subject, body):
-    host = os.environ.get("SMTP_HOST"); user = os.environ.get("SMTP_USER")
-    pw = os.environ.get("SMTP_PASS"); to = os.environ.get("ALERT_TO")
+    host = _clean(os.environ.get("SMTP_HOST"))
+    user = _clean(os.environ.get("SMTP_USER"))
+    to   = _clean(os.environ.get("ALERT_TO"))
+    frm  = _clean(os.environ.get("ALERT_FROM") or user)
+    # Gmail app passwords are 16 chars with no spaces; remove ALL whitespace
+    # (incl. the non-breaking space Google's UI sometimes inserts).
+    pw = re.sub(r"\s+", "", (os.environ.get("SMTP_PASS") or "").replace("\xa0", " "))
     if not all([host, user, pw, to]):
         print("[email] not configured; skipping"); return False
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = os.environ.get("ALERT_FROM", user)
+    msg["From"] = frm
     msg["To"] = to
     msg.set_content(body)
-    with smtplib.SMTP(host, int(os.environ.get("SMTP_PORT", "587")), timeout=HTTP_TIMEOUT) as s:
+    with smtplib.SMTP(host, int(_clean(os.environ.get("SMTP_PORT")) or "587"),
+                      timeout=HTTP_TIMEOUT) as s:
         s.starttls(); s.login(user, pw); s.send_message(msg)
     print(f"[email] sent to {to}")
     return True
@@ -241,6 +264,9 @@ def poll_once():
     today_time = float(today_time) if today_time is not None else None
     today_ml = (today_time * debit / 36.0) if (today_time is not None and debit is not None) else None
 
+    ph_min, ph_max = probe_seuils(pool, T_PH)
+    orp_min, orp_max = probe_seuils(pool, T_REDOX)
+
     reading = {
         "ts": now_iso(),
         "nickname": pool.get("poolNickname"),
@@ -251,6 +277,8 @@ def poll_once():
         "orp": probe_value(pool, T_REDOX),
         "temp": probe_value(pool, T_EAU),
         "salt": probe_value(pool, T_SALIN),
+        "ph_min": ph_min, "ph_max": ph_max,
+        "orp_min": orp_min, "orp_max": orp_max,
         "filtration": out_status(pool, SCHED_FILTRE),
         "treatment": out_status(pool, SCHED_TRAIT),
         "used_l": used,
@@ -264,19 +292,38 @@ def poll_once():
     kv_set("last_ok", now_iso())
     kv_set("last_error", None)
 
-    threshold = float(kv_get("threshold_l", DEF_THRESHOLD))
-    if used is not None and used >= threshold and not kv_get("notified"):
+    # Two-tier bottle alerts, by litres REMAINING:
+    #   warn  (e.g. 5 L left)   -> "check you have a spare"
+    #   final (e.g. 0.5 L left) -> "change the bottle now"
+    if used is not None:
         bottle = float(kv_get("bottle_l", DEF_BOTTLE))
-        body = (f"Your Klereo pool '{reading['nickname']}' has used {used:.1f} L of "
-                f"liquid chlorine from the current bottle (threshold {threshold:.0f} L, "
-                f"~{max(bottle-used,0):.1f} L left of a {bottle:.0f} L bottle).\n\n"
-                f"Time to fit a new bottle. When you do, press 'New bottle fitted' on "
-                f"the dashboard.\n")
-        try:
-            if send_email("Klereo: time to buy a new chlorine bottle", body):
-                kv_set("notified", 1); kv_set("notified_at", now_iso())
-        except Exception as e:
-            print("[email] error:", e)
+        warn_rem  = float(kv_get("warn_remaining_l", 5.0))
+        final_rem = float(kv_get("final_remaining_l", 0.5))
+        remaining = bottle - used
+        pool_name = reading["nickname"]
+
+        def _alert(subject, body, flag):
+            try:
+                if send_email(subject, body):
+                    kv_set(flag, 1); kv_set(flag + "_at", now_iso())
+            except Exception as e:
+                print("[email] error:", e)
+
+        if remaining <= final_rem:
+            if not kv_get("notified_final"):
+                _alert("Klereo: CHANGE the chlorine bottle now",
+                       f"Your pool '{pool_name}' has ~{max(remaining,0):.1f} L of liquid "
+                       f"chlorine left (used {used:.1f} L of a {bottle:.0f} L bottle).\n\n"
+                       f"Change the bottle now. When you fit the new one, press "
+                       f"'New bottle fitted' on the dashboard.\n", "notified_final")
+                kv_set("notified_warn", 1)   # suppress the redundant earlier warning
+        elif remaining <= warn_rem:
+            if not kv_get("notified_warn"):
+                _alert("Klereo: chlorine getting low - check you have a spare",
+                       f"Your pool '{pool_name}' has ~{remaining:.1f} L of liquid chlorine "
+                       f"left (used {used:.1f} L of a {bottle:.0f} L bottle).\n\n"
+                       f"Make sure you have a spare 20 L bottle ready - you'll get a second "
+                       f"email when it's time to actually change it.\n", "notified_warn")
     return reading
 
 
@@ -390,7 +437,8 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
  <div class="panel">
   <form method="post" action="/settings">
     <div class="setrow"><label>Bottle size</label><span><input name="bottle_l" id="bo" type="number" step="1"><span class="u">L</span></span></div>
-    <div class="setrow"><label>Alert when remaining</label><span><input name="remaining_l" id="rem_in" type="number" step="0.5"><span class="u">L</span></span></div>
+    <div class="setrow"><label>1st alert at</label><span><input name="warn_remaining_l" id="warn_in" type="number" step="0.5"><span class="u">L left</span></span></div>
+    <div class="setrow"><label>Final alert at</label><span><input name="final_remaining_l" id="final_in" type="number" step="0.1"><span class="u">L left</span></span></div>
     <div class="setrow"><label>Check every</label><span><input name="poll_minutes" id="pm" type="number" step="1" min="1"><span class="u">min</span></span></div>
     <button type="submit" style="width:100%;margin-top:6px">Save settings</button>
   </form>
@@ -407,7 +455,7 @@ async function load(){
  document.getElementById('title').textContent = 'Klereo Monitor - ' + (r.nickname||'');
  document.getElementById('sub').textContent =
     'last update: ' + (s.last_ok||'never') + '  |  polling every ' + s.poll_minutes + ' min'
-    + (s.notified ? '  |  ALERT SENT for this bottle' : '');
+    + (s.notified_final ? '  |  CHANGE-BOTTLE alert sent' : (s.notified_warn ? '  |  low-chlorine alert sent' : ''));
  document.getElementById('err').innerHTML = s.last_error ? '<div class="err">Last error: '+s.last_error+'</div>' : '';
  const set=(id,v,d)=>document.getElementById(id).textContent=(v==null?'-':(typeof v==='number'?v.toFixed(d):v));
  set('ph', r.ph, 2); set('orp', r.orp, 0); set('temp', r.temp, 1); set('today', r.today_ml, 0);
@@ -416,7 +464,8 @@ async function load(){
  else{f.textContent=r.filtration? 'ON':'OFF'; f.className='val '+(r.filtration?'on':'off');}
  document.getElementById('bottle').textContent=(s.bottle_l==null?'-':s.bottle_l);
  document.getElementById('bo').value=s.bottle_l;
- document.getElementById('rem_in').value=(s.bottle_l - s.threshold_l).toFixed(1);
+ document.getElementById('warn_in').value=s.warn_remaining_l;
+ document.getElementById('final_in').value=s.final_remaining_l;
  document.getElementById('pm').value=s.poll_minutes;
  if(r.used_l!=null){
    const used=r.used_l, bottle=s.bottle_l||20, rem=Math.max(bottle-used,0);
@@ -424,27 +473,30 @@ async function load(){
    document.getElementById('rem').textContent=rem.toFixed(1);
    document.getElementById('barfill').style.width=Math.min(100,used/bottle*100)+'%';
    document.getElementById('bottleinfo').textContent=
-      'fitted: '+(s.bottle_fitted_at||'-')+'   |   alert at '+(s.bottle_l - s.threshold_l).toFixed(1)+' L remaining';
+      'fitted: '+(s.bottle_fitted_at||'-')+'   |   alerts at '+s.warn_remaining_l+' L and '+s.final_remaining_l+' L left';
  } else {
    document.getElementById('used').textContent='no baseline';
    document.getElementById('bottleinfo').textContent='Press "New bottle fitted" to start tracking this bottle.';
  }
  const h = await (await fetch('/api/history')).json();
- drawChart(h);
+ drawChart(h, r);
 }
 let chart;
-function drawChart(h){
+function drawChart(h, r){
+ r = r || {};
  const labels=h.map(x=>x.ts.replace('T',' ').slice(5,16));
  const ctx=document.getElementById('chart');
  const data={labels, datasets:[
    {label:'pH', data:h.map(x=>x.ph), yAxisID:'y1', borderColor:'#38bdf8', tension:.3, pointRadius:0},
-   {label:'ORP (mV)', data:h.map(x=>x.orp), yAxisID:'y2', borderColor:'#a78bfa', tension:.3, pointRadius:0},
-   {label:'Chlorine used (L)', data:h.map(x=>x.used_l), yAxisID:'y2', borderColor:'#f59e0b', tension:.3, pointRadius:0},
+   {label:'ORP / Redox (mV)', data:h.map(x=>x.orp), yAxisID:'y2', borderColor:'#a78bfa', tension:.3, pointRadius:0},
  ]};
+ // Fixed axis ranges from the system's own limits, +/-5%
+ const y1={position:'left',title:{display:true,text:'pH'},grid:{color:'#334155'}};
+ const y2={position:'right',title:{display:true,text:'ORP mV'},grid:{display:false}};
+ if(r.ph_min!=null && r.ph_max!=null){ y1.min=+(r.ph_min*0.95).toFixed(2); y1.max=+(r.ph_max*1.05).toFixed(2); }
+ if(r.orp_min!=null && r.orp_max!=null){ y2.min=Math.round(r.orp_min*0.95); y2.max=Math.round(r.orp_max*1.05); }
  const opts={responsive:true, interaction:{mode:'index',intersect:false},
-   scales:{y1:{position:'left',title:{display:true,text:'pH'},grid:{color:'#334155'}},
-           y2:{position:'right',grid:{display:false}},
-           x:{ticks:{maxTicksLimit:8,color:'#94a3b8'},grid:{color:'#1e293b'}}},
+   scales:{y1, y2, x:{ticks:{maxTicksLimit:8,color:'#94a3b8'},grid:{color:'#1e293b'}}},
    plugins:{legend:{labels:{color:'#cbd5e1'}}}};
  if(chart) chart.destroy();
  chart=new Chart(ctx,{type:'line',data,options:opts});
@@ -505,11 +557,13 @@ def status_payload():
         "reading": kv_get("last_reading"),
         "last_ok": kv_get("last_ok"),
         "last_error": kv_get("last_error"),
-        "threshold_l": kv_get("threshold_l", DEF_THRESHOLD),
         "bottle_l": kv_get("bottle_l", DEF_BOTTLE),
+        "warn_remaining_l": kv_get("warn_remaining_l", 5.0),
+        "final_remaining_l": kv_get("final_remaining_l", 0.5),
         "baseline_total_time": kv_get("baseline_total_time"),
         "bottle_fitted_at": kv_get("bottle_fitted_at"),
-        "notified": kv_get("notified"),
+        "notified_warn": kv_get("notified_warn"),
+        "notified_final": kv_get("notified_final"),
         "poll_minutes": kv_get("poll_minutes", POLL_MINUTES),
     }
 
@@ -531,7 +585,8 @@ def do_new_bottle():
     kv_set("baseline_total_time", total)
     kv_set("debit_at_baseline", r.get("debit"))
     kv_set("bottle_fitted_at", now_iso())
-    kv_set("notified", 0)
+    kv_set("notified_warn", 0)
+    kv_set("notified_final", 0)
     # Re-poll so the dashboard immediately shows ~0 L used against the new baseline
     try:
         with _lock:
@@ -640,10 +695,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/new-bottle":
                 do_new_bottle(); self._redirect("/")
             elif path == "/settings":
-                bo = float(form["bottle_l"])
-                rem = float(form["remaining_l"])       # alert when this many L remain
-                kv_set("bottle_l", bo)
-                kv_set("threshold_l", max(0.0, bo - rem))   # stored internally as L used
+                kv_set("bottle_l", float(form["bottle_l"]))
+                kv_set("warn_remaining_l", max(0.0, float(form["warn_remaining_l"])))
+                kv_set("final_remaining_l", max(0.0, float(form["final_remaining_l"])))
                 if form.get("poll_minutes"):
                     kv_set("poll_minutes", max(1.0, float(form["poll_minutes"])))
                 self._redirect("/")
