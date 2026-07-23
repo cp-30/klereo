@@ -54,6 +54,7 @@ from email.message import EmailMessage
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+from http.cookies import SimpleCookie
 from base64 import b64decode
 
 try:
@@ -74,6 +75,12 @@ DASH_PASS    = os.environ.get("DASH_PASS")
 
 DEF_THRESHOLD = float(os.environ.get("BOTTLE_THRESHOLD_L", "15"))
 DEF_BOTTLE    = float(os.environ.get("BOTTLE_SIZE_L", "20"))
+
+# Token stored in a long-lived cookie so the login persists (no repeated prompts
+# in the iOS home-screen app). Derived from the dashboard password.
+AUTH_TOKEN = (hashlib.sha256(("klereo-auth|" + (DASH_USER or "") + "|" +
+              (DASH_PASS or "")).encode()).hexdigest() if DASH_PASS else None)
+COOKIE_MAXAGE = 34560000  # ~400 days
 
 # Probe type constants (from the Klereo bundle)
 T_PH, T_REDOX, T_EAU, T_PRESSION, T_SALIN, T_CHLORE = 3, 4, 5, 6, 8, 14
@@ -102,9 +109,10 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS readings (
             ts TEXT, total_time REAL, debit REAL, ph REAL, orp REAL,
             temp REAL, salt REAL, filtration INTEGER, used_l REAL)""")
-    if kv_get("threshold_l") is None: kv_set("threshold_l", DEF_THRESHOLD)
-    if kv_get("bottle_l")    is None: kv_set("bottle_l", DEF_BOTTLE)
-    if kv_get("notified")    is None: kv_set("notified", 0)
+    if kv_get("threshold_l")  is None: kv_set("threshold_l", DEF_THRESHOLD)
+    if kv_get("bottle_l")     is None: kv_set("bottle_l", DEF_BOTTLE)
+    if kv_get("notified")     is None: kv_set("notified", 0)
+    if kv_get("poll_minutes") is None: kv_set("poll_minutes", POLL_MINUTES)
 
 
 def kv_get(k, default=None):
@@ -282,7 +290,11 @@ def poller_loop():
         except Exception as e:
             print("[poll] error:", e)
             kv_set("last_error", f"{now_iso()}: {e}")
-        time.sleep(POLL_MINUTES * 60)
+        try:
+            mins = float(kv_get("poll_minutes", POLL_MINUTES))
+        except (TypeError, ValueError):
+            mins = POLL_MINUTES
+        time.sleep(max(1.0, mins) * 60)
 
 
 # --------------------------------------------------------------------------
@@ -347,6 +359,8 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
  input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:7px;width:90px}
  label{font-size:13px;color:#cbd5e1;margin-right:6px}
  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px}
+ .setrow{display:flex;justify-content:space-between;align-items:center;margin:10px 0}
+ .setrow label{margin:0} .setrow input{width:70px;text-align:right} .setrow .u{color:#94a3b8;margin-left:6px}
  .err{background:#7f1d1d;color:#fecaca;padding:8px 12px;border-radius:8px;margin-top:12px;font-size:13px}
 </style></head><body>
  <div id="ptr" style="position:fixed;top:0;left:0;right:0;text-align:center;padding:8px;color:#94a3b8;font-size:13px;transform:translateY(-40px);transition:transform .15s;z-index:6">&#8595; pull to refresh</div>
@@ -374,12 +388,16 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
  </div>
  <div class="panel"><canvas id="chart" height="120"></canvas></div>
  <div class="panel">
-  <form method="post" action="/settings" class="row">
-    <label>Alert at (L)</label><input name="threshold_l" id="th" type="number" step="0.5">
-    <label>Bottle size (L)</label><input name="bottle_l" id="bo" type="number" step="1">
-    <button type="submit">Save settings</button>
+  <form method="post" action="/settings">
+    <div class="setrow"><label>Bottle size</label><span><input name="bottle_l" id="bo" type="number" step="1"><span class="u">L</span></span></div>
+    <div class="setrow"><label>Alert when remaining</label><span><input name="remaining_l" id="rem_in" type="number" step="0.5"><span class="u">L</span></span></div>
+    <div class="setrow"><label>Check every</label><span><input name="poll_minutes" id="pm" type="number" step="1" min="1"><span class="u">min</span></span></div>
+    <button type="submit" style="width:100%;margin-top:6px">Save settings</button>
   </form>
-  <form method="post" action="/poll-now" class="row"><button class="ghost" type="submit">Poll now</button></form>
+  <div class="row">
+    <form method="post" action="/poll-now"><button class="ghost" type="submit">Poll now</button></form>
+    <form method="post" action="/test-email"><button class="ghost" type="submit">Send test email</button></form>
+  </div>
  </div>
 </div>
 <script>
@@ -397,14 +415,16 @@ async function load(){
  if(r.filtration==null){f.textContent='-';f.className='val';}
  else{f.textContent=r.filtration? 'ON':'OFF'; f.className='val '+(r.filtration?'on':'off');}
  document.getElementById('bottle').textContent=(s.bottle_l==null?'-':s.bottle_l);
- document.getElementById('th').value=s.threshold_l; document.getElementById('bo').value=s.bottle_l;
+ document.getElementById('bo').value=s.bottle_l;
+ document.getElementById('rem_in').value=(s.bottle_l - s.threshold_l).toFixed(1);
+ document.getElementById('pm').value=s.poll_minutes;
  if(r.used_l!=null){
    const used=r.used_l, bottle=s.bottle_l||20, rem=Math.max(bottle-used,0);
    document.getElementById('used').textContent=used.toFixed(1);
    document.getElementById('rem').textContent=rem.toFixed(1);
    document.getElementById('barfill').style.width=Math.min(100,used/bottle*100)+'%';
    document.getElementById('bottleinfo').textContent=
-      'fitted: '+(s.bottle_fitted_at||'-')+'   |   alert threshold: '+s.threshold_l+' L';
+      'fitted: '+(s.bottle_fitted_at||'-')+'   |   alert at '+(s.bottle_l - s.threshold_l).toFixed(1)+' L remaining';
  } else {
    document.getElementById('used').textContent='no baseline';
    document.getElementById('bottleinfo').textContent='Press "New bottle fitted" to start tracking this bottle.';
@@ -455,6 +475,31 @@ load(); setInterval(load, 60000);
 </script></body></html>"""
 
 
+def login_html(error=""):
+    err = ('<div style="color:#f87171;font-size:13px;margin-bottom:8px">'
+           + error + '</div>') if error else ""
+    return ("""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Pool">
+<meta name="theme-color" content="#0f172a"><title>Pool - Login</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;
+display:flex;min-height:100vh;margin:0;align-items:center;justify-content:center}
+form{background:#1e293b;padding:26px;border-radius:14px;width:260px}
+h1{font-size:18px;margin:0 0 16px}
+input{width:100%;box-sizing:border-box;background:#0f172a;border:1px solid #334155;color:#e2e8f0;
+border-radius:8px;padding:10px;margin-bottom:10px;font-size:15px}
+button{width:100%;background:#2563eb;color:#fff;border:0;border-radius:8px;padding:11px;font-size:15px}
+</style></head><body>
+<form method="post" action="/login">
+ <h1>&#128167; Pool Monitor</h1>""" + err + """
+ <input name="username" type="text" placeholder="Username" value="admin" autocomplete="username">
+ <input name="password" type="password" placeholder="Password" autocomplete="current-password">
+ <button type="submit">Log in</button>
+</form></body></html>""")
+
+
 def status_payload():
     return {
         "reading": kv_get("last_reading"),
@@ -465,7 +510,7 @@ def status_payload():
         "baseline_total_time": kv_get("baseline_total_time"),
         "bottle_fitted_at": kv_get("bottle_fitted_at"),
         "notified": kv_get("notified"),
-        "poll_minutes": POLL_MINUTES,
+        "poll_minutes": kv_get("poll_minutes", POLL_MINUTES),
     }
 
 
@@ -487,6 +532,12 @@ def do_new_bottle():
     kv_set("debit_at_baseline", r.get("debit"))
     kv_set("bottle_fitted_at", now_iso())
     kv_set("notified", 0)
+    # Re-poll so the dashboard immediately shows ~0 L used against the new baseline
+    try:
+        with _lock:
+            poll_once()
+    except Exception:
+        pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -498,6 +549,16 @@ class Handler(BaseHTTPRequestHandler):
     def _authed(self):
         if not DASH_PASS:
             return True
+        # 1) long-lived cookie (set at /login) - persists the session
+        ck = self.headers.get("Cookie")
+        if ck:
+            try:
+                sc = SimpleCookie(ck)
+                if "klereo_auth" in sc and sc["klereo_auth"].value == AUTH_TOKEN:
+                    return True
+            except Exception:
+                pass
+        # 2) HTTP Basic (for curl / scripts / API)
         h = self.headers.get("Authorization", "")
         if h.startswith("Basic "):
             try:
@@ -512,6 +573,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("WWW-Authenticate", 'Basic realm="Klereo Monitor"')
         self.end_headers()
         self.wfile.write(b"Auth required")
+
+    def _login_ok(self):
+        self.send_response(302)
+        self.send_header("Location", "/")
+        self.send_header("Set-Cookie",
+                         f"klereo_auth={AUTH_TOKEN}; Max-Age={COOKIE_MAXAGE}; "
+                         f"Path=/; HttpOnly; SameSite=Lax")
+        self.end_headers()
 
     def _send(self, code, body, ctype="text/html; charset=utf-8"):
         if isinstance(body, str):
@@ -536,8 +605,13 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/apple-touch-icon.png", "/apple-touch-icon-precomposed.png",
                     "/favicon.ico", "/icon.png"):
             return self._send(200, ICON_PNG, "image/png")
+        if path == "/login":
+            return self._send(200, login_html())
         if not self._authed():
-            return self._auth_challenge()
+            # pages -> friendly login form; API -> basic-auth challenge
+            if path.startswith("/api"):
+                return self._auth_challenge()
+            return self._redirect("/login")
         if path == "/":
             self._send(200, PAGE)
         elif path == "/api/status":
@@ -548,23 +622,50 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "not found")
 
     def do_POST(self):
-        if not self._authed():
-            return self._auth_challenge()
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", "0") or 0)
         body = self.rfile.read(length).decode("utf-8") if length else ""
         form = {k: v[0] for k, v in parse_qs(body).items()}
+
+        # login is reachable without prior auth
+        if path == "/login":
+            if (not DASH_PASS) or (form.get("password") == DASH_PASS
+                                   and form.get("username", DASH_USER) == DASH_USER):
+                return self._login_ok()
+            return self._send(401, login_html("Wrong username or password."))
+
+        if not self._authed():
+            return self._auth_challenge()
         try:
             if path == "/new-bottle":
                 do_new_bottle(); self._redirect("/")
             elif path == "/settings":
-                kv_set("threshold_l", float(form["threshold_l"]))
-                kv_set("bottle_l", float(form["bottle_l"]))
+                bo = float(form["bottle_l"])
+                rem = float(form["remaining_l"])       # alert when this many L remain
+                kv_set("bottle_l", bo)
+                kv_set("threshold_l", max(0.0, bo - rem))   # stored internally as L used
+                if form.get("poll_minutes"):
+                    kv_set("poll_minutes", max(1.0, float(form["poll_minutes"])))
                 self._redirect("/")
             elif path == "/poll-now":
                 with _lock:
                     poll_once()
                 self._redirect("/")
+            elif path == "/test-email":
+                try:
+                    ok = send_email("Klereo Monitor: test email",
+                                    "This is a test from your Klereo Monitor. "
+                                    "If you received it, email alerts are working.")
+                    msg = ("Test email sent - check your inbox (and spam)." if ok
+                           else "Email is NOT configured. Set SMTP_HOST / SMTP_USER / "
+                                "SMTP_PASS / ALERT_TO in klereo.env, then restart.")
+                except Exception as e:
+                    msg = f"Email FAILED: {e}"
+                self._send(200, "<!doctype html><meta charset=utf-8>"
+                           "<body style='font-family:sans-serif;background:#0f172a;"
+                           "color:#e2e8f0;padding:24px'>"
+                           f"<p>{msg}</p><p><a style='color:#93c5fd' href='/'>&larr; "
+                           "Back to dashboard</a></p>")
             else:
                 self._send(404, "not found")
         except Exception as e:
