@@ -1,0 +1,5 @@
+# Secrets and local data - never commit these
+klereo.env
+*.db
+__pycache__/
+*.pyc
