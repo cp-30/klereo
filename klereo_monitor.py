@@ -432,11 +432,26 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
  .seg{display:inline-flex;background:#0f172a;border:1px solid #334155;border-radius:8px;overflow:hidden}
  .seg button{background:transparent;color:#cbd5e1;border:0;padding:6px 12px;font-size:13px;cursor:pointer}
  .seg button.active{background:#2563eb;color:#fff}
+ .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:40;padding:20px}
+ .modal.show{display:flex}
+ .modalcard{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:20px;width:320px;max-width:100%}
 </style></head><body>
  <div id="ptr" style="position:fixed;top:0;left:0;right:0;text-align:center;padding:8px;color:#94a3b8;font-size:13px;transform:translateY(-40px);transition:transform .15s;z-index:6">&#8595; pull to refresh</div>
  <div id="toast" class="toast"></div>
+ <div id="bottleModal" class="modal"><div class="modalcard">
+   <div style="font-size:16px;font-weight:600;margin-bottom:14px">Register new bottle</div>
+   <label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="bmNow" checked onchange="bmToggle()"> Fitted now</label>
+   <div id="bmWhen" style="margin-top:12px;display:none">
+     <div style="font-size:13px;color:#94a3b8;margin-bottom:5px">Date &amp; time fitted (past only):</div>
+     <input type="datetime-local" id="bmTime" style="width:100%;box-sizing:border-box;background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:9px;font-size:14px">
+   </div>
+   <div style="display:flex;gap:10px;margin-top:18px">
+     <button type="button" onclick="closeBottle()" class="ghost" style="flex:1;margin:0">Cancel</button>
+     <button type="button" onclick="confirmBottle()" style="flex:1">Confirm</button>
+   </div>
+ </div></div>
  <div class="wrap">
- <a href="/config" class="ghost" title="Settings" style="position:fixed;top:10px;right:58px;z-index:5;font-size:18px;line-height:1;padding:8px 12px;text-decoration:none">&#9881;</a>
+ <a href="/config" title="Settings" style="position:fixed;top:10px;right:58px;z-index:5;font-size:22px;line-height:1;padding:6px 10px;text-decoration:none;color:#fff;background:#334155;border-radius:8px">&#9881;</a>
  <button id="refbtn" class="ghost" title="Refresh" style="position:fixed;top:10px;right:10px;z-index:5;font-size:18px;line-height:1;padding:8px 12px" onclick="refresh()">&#8635;</button>
  <h1 id="title">Klereo Monitor</h1>
  <div class="sub" id="sub">loading...</div>
@@ -454,11 +469,7 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
      &nbsp; <span class="unit">/ <span id="rem">-</span> L left of <span id="bottle">-</span> L</span></div>
   <div class="bar"><div id="barfill" style="width:0%"></div></div>
   <div class="sub" id="bottleinfo" style="margin-top:10px"></div>
-  <button type="button" onclick="newBottle()">New bottle fitted</button>
-  <div style="margin-top:8px;font-size:13px;color:#cbd5e1">
-    <label><input type="checkbox" id="backdate" onchange="document.getElementById('bdwrap').style.display=this.checked?'inline-block':'none'"> fitted earlier?</label>
-    <span id="bdwrap" style="display:none;margin-left:8px"><input type="datetime-local" id="bdtime" style="background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:5px;font-size:13px"></span>
-  </div>
+  <button type="button" onclick="openBottle()">Register new bottle</button>
  </div>
  <div class="panel">
   <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase;margin-bottom:6px">pH &amp; Redox</div>
@@ -518,20 +529,27 @@ async function postAction(url, body){
  try{ const r=await fetch(url,opt); return await r.json(); }
  catch(e){ return {ok:false, message:'Network error'}; }
 }
-async function newBottle(){
+function localNowStr(){ const d=new Date(); const p=n=>String(n).padStart(2,'0');
+ return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes()); }
+function bmToggle(){ document.getElementById('bmWhen').style.display=document.getElementById('bmNow').checked?'none':'block'; }
+function openBottle(){
+ document.getElementById('bmNow').checked=true;
+ const t=document.getElementById('bmTime'); t.value=localNowStr(); t.max=localNowStr();
+ bmToggle();
+ document.getElementById('bottleModal').classList.add('show');
+}
+function closeBottle(){ document.getElementById('bottleModal').classList.remove('show'); }
+async function confirmBottle(){
  let body='';
- const bd=document.getElementById('backdate');
- if(bd && bd.checked){
-   const t=document.getElementById('bdtime').value;
-   if(!t){ showToast('Pick when you fitted it, or untick "fitted earlier?"', false); return; }
-   if(!confirm('Record the new bottle as fitted on '+t.replace('T',' ')+'?')) return;
-   body='at_ms='+new Date(t).getTime();
- } else {
-   if(!confirm('Reset tracking to now? Only do this when you have fitted a NEW bottle.')) return;
+ if(!document.getElementById('bmNow').checked){
+   const t=document.getElementById('bmTime').value;
+   if(!t){ showToast('Pick a date and time.', false); return; }
+   const chosen=new Date(t).getTime();
+   if(chosen>Date.now()){ showToast('Date must be in the past.', false); return; }
+   body='at_ms='+chosen;
  }
- const r=await postAction('/new-bottle', body); showToast(r.message, r.ok);
- if(bd && bd.checked){ bd.checked=false; document.getElementById('bdwrap').style.display='none'; }
- load();
+ closeBottle();
+ const r=await postAction('/new-bottle', body); showToast(r.message, r.ok); load();
 }
 let usageChart, usagePeriod='day', usageData=[];
 async function loadUsage(){
