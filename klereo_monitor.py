@@ -291,16 +291,14 @@ def poll_once():
     ph_min, ph_max = probe_seuils(pool, T_PH)
     orp_min, orp_max = probe_seuils(pool, T_REDOX)
 
-    # Salt cell: grams of chlorine generated today, from production rate x run time.
-    #   g = Elec_ProdNormal(mg/h) * ElectroChlore_TodayTime(s)/3600 / 1000
-    # mL-of-liquid-chlorine equivalent uses a configurable strength (g active Cl / L).
-    prod   = params.get("Elec_ProdNormal")
-    e_time = params.get("ElectroChlore_TodayTime")
-    prod   = float(prod) if prod is not None else None
-    e_time = float(e_time) if e_time is not None else None
-    salt_g = (prod * e_time / 3600.0 / 1000.0) if (prod is not None and e_time is not None) else None
-    gpl = float(kv_get("liquid_cl_gpl", 48.0))
-    salt_ml = (salt_g / gpl * 1000.0) if (salt_g is not None and gpl > 0) else None
+    # Salt cell "generated today": ElectroChlore_TodayTime turned out NOT to be
+    # the cell's run-time (it's non-zero even when the cell is idle), so we don't
+    # trust the old formula. Shown as n/a until we identify the right field.
+    # Store the raw chemistry params so we can inspect them via /api/raw.
+    kv_set("last_params", params)
+    kv_set("last_extra", extra)
+    salt_g = None
+    salt_ml = None
 
     reading = {
         "ts": now_iso(),
@@ -849,6 +847,21 @@ def history_payload(days=1):
     return rows
 
 
+def raw_payload():
+    """Chemistry-related raw params from the last poll, for diagnosing which
+    field really tracks salt-cell production. Filtered to keep the dump small."""
+    p = kv_get("last_params") or {}
+    e = kv_get("last_extra") or {}
+    pat = re.compile(r"(elec|chlor|salt|sel|prod|hyb|trait|redox|orp|couv|cover|conso)", re.I)
+    out = {}
+    for src, vals in (("params", p), ("ExtraParams", e)):
+        if isinstance(vals, dict):
+            for k, v in vals.items():
+                if pat.search(k):
+                    out[f"{src}.{k}"] = v
+    return out
+
+
 def usage_payload():
     """Chlorine used per calendar day, derived from the lifetime odometer.
     litres(reading) = total_time * debit / 36000; daily use = day-end minus
@@ -1005,6 +1018,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(history_payload(days))
         elif path == "/api/usage":
             self._json(usage_payload())
+        elif path == "/api/raw":
+            self._json(raw_payload())
         else:
             self._send(404, "not found")
 
