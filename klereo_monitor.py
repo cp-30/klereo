@@ -291,14 +291,15 @@ def poll_once():
     ph_min, ph_max = probe_seuils(pool, T_PH)
     orp_min, orp_max = probe_seuils(pool, T_REDOX)
 
-    # Salt cell "generated today": ElectroChlore_TodayTime turned out NOT to be
-    # the cell's run-time (it's non-zero even when the cell is idle), so we don't
-    # trust the old formula. Shown as n/a until we identify the right field.
-    # Store the raw chemistry params so we can inspect them via /api/raw.
-    kv_set("last_params", params)
+    # Salt cell chlorine produced: Elec_GramDone is already in grams and reads 0
+    # when the cell is idle (identified from /api/raw). mL-liquid-equivalent uses
+    # the configurable liquid strength (g active Cl per litre).
+    kv_set("last_params", params)      # kept for /api/raw diagnostics
     kv_set("last_extra", extra)
-    salt_g = None
-    salt_ml = None
+    salt_g = params.get("Elec_GramDone")
+    salt_g = float(salt_g) if salt_g is not None else None
+    gpl = float(kv_get("liquid_cl_gpl", 48.0))
+    salt_ml = (salt_g / gpl * 1000.0) if (salt_g is not None and gpl > 0) else None
 
     reading = {
         "ts": now_iso(),
@@ -437,8 +438,8 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
  .status{font-size:15px;color:#cbd5e1;margin-bottom:14px}
  h1 img{width:28px;height:28px;vertical-align:middle;border-radius:6px;margin-right:9px}
  button svg{vertical-align:-3px;margin-right:7px}
- .bar{height:14px;background:#334155;border-radius:8px;overflow:hidden;margin-top:8px}
- .bar>div{height:100%;background:linear-gradient(90deg,#22c55e,#eab308,#ef4444)}
+ .bar{position:relative;height:14px;background:linear-gradient(90deg,#22c55e,#eab308,#ef4444);border-radius:8px;overflow:hidden;margin-top:8px}
+ .bar>div{position:absolute;top:0;right:0;height:100%;background:#334155}
  .panel{background:#1e293b;border-radius:12px;padding:16px;margin-top:16px}
  button{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:9px 14px;font-size:14px;cursor:pointer}
  button.ghost{background:#334155}
@@ -542,7 +543,7 @@ async function load(){
    const used=r.used_l, bottle=s.bottle_l||20, rem=Math.max(bottle-used,0);
    document.getElementById('used').textContent=used.toFixed(1);
    document.getElementById('rem').textContent=rem.toFixed(1);
-   document.getElementById('barfill').style.width=Math.min(100,used/bottle*100)+'%';
+   document.getElementById('barfill').style.width=Math.max(0,100-used/bottle*100)+'%';
    document.getElementById('bottleinfo').textContent=
       'fitted '+relTime(s.bottle_fitted_at)+'   |   alerts at '+s.warn_remaining_l+' L and '+s.final_remaining_l+' L left';
  } else {
@@ -793,6 +794,10 @@ a{color:#93c5fd}
 </div>
 <button type="button" onclick="saveConfig()" style="width:100%;margin-top:14px">Save settings</button>
 <div class="hint" style="text-align:center;margin-top:8px">Saved on the server; secrets are never shown back here.</div>
+<div class="panel"><div class="lbl2">Diagnostics</div>
+ <a href="/api/raw" target="_blank">View raw Klereo chemistry fields (/api/raw)</a>
+ <div class="hint">Handy for checking values like the salt cell (Elec_GramDone).</div>
+</div>
 """
     tail = ("""
 </div><script>
