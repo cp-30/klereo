@@ -219,6 +219,13 @@ def probe_seuils(pool, ptype):
     return None, None
 
 
+def out_mode(pool, index):
+    for o in pool.get("outs") or []:
+        if o.get("index") == index:
+            return o.get("mode")
+    return None
+
+
 # --------------------------------------------------------------------------
 # Poll + alert
 # --------------------------------------------------------------------------
@@ -284,6 +291,17 @@ def poll_once():
     ph_min, ph_max = probe_seuils(pool, T_PH)
     orp_min, orp_max = probe_seuils(pool, T_REDOX)
 
+    # Salt cell: grams of chlorine generated today, from production rate x run time.
+    #   g = Elec_ProdNormal(mg/h) * ElectroChlore_TodayTime(s)/3600 / 1000
+    # mL-of-liquid-chlorine equivalent uses a configurable strength (g active Cl / L).
+    prod   = params.get("Elec_ProdNormal")
+    e_time = params.get("ElectroChlore_TodayTime")
+    prod   = float(prod) if prod is not None else None
+    e_time = float(e_time) if e_time is not None else None
+    salt_g = (prod * e_time / 3600.0 / 1000.0) if (prod is not None and e_time is not None) else None
+    gpl = float(kv_get("liquid_cl_gpl", 48.0))
+    salt_ml = (salt_g / gpl * 1000.0) if (salt_g is not None and gpl > 0) else None
+
     reading = {
         "ts": now_iso(),
         "nickname": pool.get("poolNickname"),
@@ -296,7 +314,9 @@ def poll_once():
         "salt": probe_value(pool, T_SALIN),
         "ph_min": ph_min, "ph_max": ph_max,
         "orp_min": orp_min, "orp_max": orp_max,
+        "salt_g": salt_g, "salt_ml": salt_ml,
         "filtration": out_status(pool, SCHED_FILTRE),
+        "filt_mode": out_mode(pool, SCHED_FILTRE),
         "treatment": out_status(pool, SCHED_TRAIT),
         "used_l": used,
         "suspended": pool.get("suspended"),
@@ -401,9 +421,9 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Pool">
+<meta name="apple-mobile-web-app-title" content="Pool Stats">
 <meta name="theme-color" content="#0f172a">
-<title>Pool</title>
+<title>Pool Stats</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
@@ -415,6 +435,10 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
  .card .val{font-size:26px;font-weight:600;margin-top:4px}
  .card .unit{font-size:14px;color:#94a3b8}
  .on{color:#4ade80} .off{color:#f87171}
+ .ok{color:#4ade80} .warn{color:#fbbf24} .bad{color:#f87171}
+ .status{font-size:15px;color:#cbd5e1;margin-bottom:14px}
+ h1 img{width:28px;height:28px;vertical-align:middle;border-radius:6px;margin-right:9px}
+ button svg{vertical-align:-3px;margin-right:7px}
  .bar{height:14px;background:#334155;border-radius:8px;overflow:hidden;margin-top:8px}
  .bar>div{height:100%;background:linear-gradient(90deg,#22c55e,#eab308,#ef4444)}
  .panel{background:#1e293b;border-radius:12px;padding:16px;margin-top:16px}
@@ -453,15 +477,16 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
  <div class="wrap">
  <a href="/config" title="Settings" style="position:fixed;top:10px;right:58px;z-index:5;font-size:22px;line-height:1;padding:6px 10px;text-decoration:none;color:#fff;background:#334155;border-radius:8px">&#9881;</a>
  <button id="refbtn" class="ghost" title="Refresh" style="position:fixed;top:10px;right:10px;z-index:5;font-size:18px;line-height:1;padding:8px 12px" onclick="refresh()">&#8635;</button>
- <h1 id="title">Klereo Monitor</h1>
- <div class="sub" id="sub">loading...</div>
+ <h1 id="title"><img src="/apple-touch-icon.png" alt="">Pool Stats <span id="nick" style="font-size:14px;color:#94a3b8;font-weight:400"></span></h1>
+ <div class="status" id="sub">loading...</div>
  <div id="err"></div>
  <div class="grid">
   <div class="card"><div class="lbl">pH</div><div class="val" id="ph">-</div><div class="unit">target 6.6-8.0</div></div>
   <div class="card"><div class="lbl">ORP / Redox</div><div class="val" id="orp">-</div><div class="unit">mV</div></div>
   <div class="card"><div class="lbl">Water temp</div><div class="val" id="temp">-</div><div class="unit">&deg;C</div></div>
-  <div class="card"><div class="lbl">Filtration</div><div class="val" id="filt">-</div></div>
+  <div class="card"><div class="lbl">Filtration</div><div class="val" id="filt">-</div><div class="unit" id="filtmode"></div></div>
   <div class="card"><div class="lbl">Dosed today</div><div class="val" id="today">-</div><div class="unit">mL liquid Cl</div></div>
+  <div class="card"><div class="lbl">Salt cell today</div><div class="val" id="saltgen">-</div><div class="unit" id="saltml"></div></div>
  </div>
  <div class="panel">
   <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Liquid chlorine bottle</div>
@@ -469,11 +494,18 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
      &nbsp; <span class="unit">/ <span id="rem">-</span> L left of <span id="bottle">-</span> L</span></div>
   <div class="bar"><div id="barfill" style="width:0%"></div></div>
   <div class="sub" id="bottleinfo" style="margin-top:10px"></div>
-  <button type="button" onclick="openBottle()">Register new bottle</button>
+  <button type="button" onclick="openBottle()"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6M10 2v3.5L7 9v11a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9l-3-3.5V2"/><path d="M7 13h10"/></svg>Register new bottle</button>
  </div>
  <div class="panel">
-  <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase;margin-bottom:6px">pH &amp; Redox</div>
-  <canvas id="chart" height="120"></canvas>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">pH &amp; Redox</div>
+    <div class="seg">
+      <button id="segR24" class="active" type="button" onclick="setRange(1)">24h</button>
+      <button id="segR7" type="button" onclick="setRange(7)">7d</button>
+      <button id="segR30" type="button" onclick="setRange(30)">30d</button>
+    </div>
+  </div>
+  <div style="position:relative;height:200px"><canvas id="chart"></canvas></div>
  </div>
  <div class="panel">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
@@ -492,16 +524,21 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
 async function load(){
  const s = await (await fetch('/api/status')).json();
  const r = s.reading || {};
- document.getElementById('title').textContent = 'Klereo Monitor - ' + (r.nickname||'');
+ document.getElementById('nick').textContent = (r.nickname||'');
  document.getElementById('sub').textContent =
-    'last update: ' + (s.last_ok||'never') + '  |  polling every ' + s.poll_minutes + ' min'
+    'Updated ' + relTime(s.last_ok) + '  |  every ' + s.poll_minutes + ' min'
     + (s.notified_final ? '  |  CHANGE-BOTTLE alert sent' : (s.notified_warn ? '  |  low-chlorine alert sent' : ''));
  document.getElementById('err').innerHTML = s.last_error ? '<div class="err">Last error: '+s.last_error+'</div>' : '';
  const set=(id,v,d)=>document.getElementById(id).textContent=(v==null?'-':(typeof v==='number'?v.toFixed(d):v));
- set('ph', r.ph, 2); set('orp', r.orp, 0); set('temp', r.temp, 1); set('today', r.today_ml, 0);
+ set('temp', r.temp, 1); set('today', r.today_ml, 0);
+ setZone('ph', r.ph, r.ph_min, r.ph_max, 2);
+ setZone('orp', r.orp, r.orp_min, r.orp_max, 0);
+ set('saltgen', r.salt_g, 1);
+ document.getElementById('saltml').textContent = (r.salt_ml!=null) ? ('g Cl  ~ '+r.salt_ml.toFixed(0)+' mL liquid') : 'g Cl';
  const f=document.getElementById('filt');
  if(r.filtration==null){f.textContent='-';f.className='val';}
  else{f.textContent=r.filtration? 'ON':'OFF'; f.className='val '+(r.filtration?'on':'off');}
+ document.getElementById('filtmode').textContent = modeName(r.filt_mode);
  document.getElementById('bottle').textContent=(s.bottle_l==null?'-':s.bottle_l);
  if(r.used_l!=null){
    const used=r.used_l, bottle=s.bottle_l||20, rem=Math.max(bottle-used,0);
@@ -509,14 +546,40 @@ async function load(){
    document.getElementById('rem').textContent=rem.toFixed(1);
    document.getElementById('barfill').style.width=Math.min(100,used/bottle*100)+'%';
    document.getElementById('bottleinfo').textContent=
-      'fitted: '+(s.bottle_fitted_at||'-')+'   |   alerts at '+s.warn_remaining_l+' L and '+s.final_remaining_l+' L left';
+      'fitted '+relTime(s.bottle_fitted_at)+'   |   alerts at '+s.warn_remaining_l+' L and '+s.final_remaining_l+' L left';
  } else {
    document.getElementById('used').textContent='no baseline';
-   document.getElementById('bottleinfo').textContent='Press "New bottle fitted" to start tracking this bottle.';
+   document.getElementById('bottleinfo').textContent='Tap "Register new bottle" to start tracking.';
  }
- const h = await (await fetch('/api/history')).json();
- drawChart(h, r);
+ lastReading = r;
+ drawChart();
  loadUsage();
+}
+function relTime(iso){
+ if(!iso) return 'never';
+ const d=new Date(iso); if(isNaN(d)) return iso;
+ const now=new Date(), y=new Date(); y.setDate(now.getDate()-1);
+ const same=(a,b)=>a.toDateString()===b.toDateString();
+ const hm=d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+ if(same(d,now)) return 'today '+hm;
+ if(same(d,y)) return 'yesterday '+hm;
+ return d.toLocaleDateString([], {weekday:'short',day:'numeric',month:'short'})+' '+hm;
+}
+function zone(v,min,max){
+ if(v==null||min==null||max==null) return '';
+ if(v<min||v>max) return 'bad';
+ const rng=max-min, m=rng*0.12;
+ if(v<=min+m||v>=max-m) return 'warn';
+ return 'ok';
+}
+function setZone(id,v,min,max,dec){
+ const el=document.getElementById(id);
+ el.textContent=(v==null?'-':v.toFixed(dec));
+ el.className='val '+zone(v,min,max);
+}
+function modeName(m){
+ const names={0:'Manual',1:'Scheduled',2:'Timer',3:'Regulated',4:'Cloned',5:'Special',6:'Test',8:'Pulse'};
+ return (m==null)?'':(names[m]||('mode '+m));
 }
 function showToast(msg, ok){
  const t=document.getElementById('toast');
@@ -589,25 +652,32 @@ function drawUsage(){
  if(usageChart) usageChart.destroy();
  usageChart=new Chart(ctx,{type:'bar',data,options:opts});
 }
-let chart;
-function drawChart(h, r){
- r = r || {};
- const labels=h.map(x=>x.ts.replace('T',' ').slice(5,16));
- const ctx=document.getElementById('chart');
- const data={labels, datasets:[
-   {label:'pH', data:h.map(x=>x.ph), yAxisID:'y1', borderColor:'#38bdf8', tension:.3, pointRadius:0},
-   {label:'ORP / Redox (mV)', data:h.map(x=>x.orp), yAxisID:'y2', borderColor:'#a78bfa', tension:.3, pointRadius:0},
+let chart, chartRange=1, lastReading={};
+function setRange(d){
+ chartRange=d;
+ [[1,'segR24'],[7,'segR7'],[30,'segR30']].forEach(a=>document.getElementById(a[1]).classList.toggle('active', a[0]===d));
+ drawChart();
+}
+async function drawChart(){
+ const r=lastReading||{};
+ let h=[];
+ try{ h=await (await fetch('/api/history?days='+chartRange)).json(); }catch(e){}
+ const fmt=x=>{const d=new Date(x.ts); return chartRange<=1
+    ? d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})
+    : (d.getDate()+'/'+(d.getMonth()+1)); };
+ const data={labels:h.map(fmt), datasets:[
+   {label:'pH', data:h.map(x=>x.ph), yAxisID:'y1', borderColor:'#38bdf8', borderWidth:2, tension:.3, pointRadius:0},
+   {label:'ORP', data:h.map(x=>x.orp), yAxisID:'y2', borderColor:'#a78bfa', borderWidth:2, tension:.3, pointRadius:0},
  ]};
- // Fixed axis ranges from the system's own limits, +/-5%
- const y1={position:'left',title:{display:true,text:'pH'},grid:{color:'#334155'}};
- const y2={position:'right',title:{display:true,text:'ORP mV'},grid:{display:false}};
+ const y1={position:'left',title:{display:true,text:'pH',color:'#94a3b8'},grid:{color:'#334155'},ticks:{color:'#cbd5e1',font:{size:12}}};
+ const y2={position:'right',title:{display:true,text:'mV',color:'#94a3b8'},grid:{display:false},ticks:{color:'#cbd5e1',font:{size:12}}};
  if(r.ph_min!=null && r.ph_max!=null){ y1.min=+(r.ph_min*0.95).toFixed(2); y1.max=+(r.ph_max*1.05).toFixed(2); }
  if(r.orp_min!=null && r.orp_max!=null){ y2.min=Math.round(r.orp_min*0.95); y2.max=Math.round(r.orp_max*1.05); }
- const opts={responsive:true, interaction:{mode:'index',intersect:false},
-   scales:{y1, y2, x:{ticks:{maxTicksLimit:8,color:'#94a3b8'},grid:{color:'#1e293b'}}},
-   plugins:{legend:{labels:{color:'#cbd5e1'}}}};
+ const opts={responsive:true, maintainAspectRatio:false, interaction:{mode:'index',intersect:false},
+   scales:{y1, y2, x:{ticks:{maxTicksLimit:6,color:'#94a3b8',font:{size:11},maxRotation:0,autoSkip:true},grid:{display:false}}},
+   plugins:{legend:{labels:{color:'#cbd5e1',boxWidth:12,font:{size:13}}}}};
  if(chart) chart.destroy();
- chart=new Chart(ctx,{type:'line',data,options:opts});
+ chart=new Chart(document.getElementById('chart'),{type:'line',data,options:opts});
 }
 async function refresh(){
  const ptr=document.getElementById('ptr');
@@ -669,6 +739,7 @@ def config_html():
     warn   = kv_get("warn_remaining_l", 5.0)
     final  = kv_get("final_remaining_l", 0.5)
     poll   = kv_get("poll_minutes", POLL_MINUTES)
+    gpl    = kv_get("liquid_cl_gpl", 48.0)
     port   = val("SMTP_PORT") or "587"
     head = ("""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -704,6 +775,8 @@ a{color:#93c5fd}
  <div class="setrow"><label>1st alert at</label><span><input id="warn" type="number" step="0.5" value="{warn}"><span class="u">L left</span></span></div>
  <div class="setrow"><label>Final alert at</label><span><input id="final" type="number" step="0.1" value="{final}"><span class="u">L left</span></span></div>
  <div class="setrow"><label>Check every</label><span><input id="poll" type="number" step="1" min="1" value="{poll}"><span class="u">min</span></span></div>
+ <div class="setrow"><label>Liquid Cl strength</label><span><input id="gpl" type="number" step="1" value="{gpl}"><span class="u">g/L</span></span></div>
+ <div class="hint">Used to show the salt cell's output as a liquid-chlorine mL equivalent.</div>
 </div>
 <div class="panel"><div class="lbl2">Klereo account</div>
  <div class="setrow"><label>Login</label><input id="KLEREO_LOGIN" type="text" value="{val('KLEREO_LOGIN')}"></div>
@@ -737,7 +810,7 @@ async function postAction(url, body){
 }
 async function testEmail(){ showToast('Sending test email...'); const r=await postAction('/test-email'); showToast(r.message, r.ok); }
 async function saveConfig(){
- const ids=['bottle_l','warn','final','poll','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS'];
+ const ids=['bottle_l','warn','final','poll','gpl','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS'];
  const p=new URLSearchParams();
  ids.forEach(id=>{const el=document.getElementById(id); if(el && el.value!=='') p.append(id, el.value);});
  const r=await postAction('/config', p.toString()); showToast(r.message, r.ok);
@@ -763,11 +836,17 @@ def status_payload():
     }
 
 
-def history_payload():
+def history_payload(days=1):
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc).astimezone() - timedelta(days=days)).isoformat()
     with db() as c:
-        rows = c.execute("SELECT ts,ph,orp,temp,used_l FROM readings "
-                         "ORDER BY ts DESC LIMIT 500").fetchall()
-    return list(reversed([dict(r) for r in rows]))
+        rows = c.execute("SELECT ts,ph,orp,temp,used_l FROM readings WHERE ts>=? "
+                         "ORDER BY ts", (cutoff,)).fetchall()
+    rows = [dict(r) for r in rows]
+    if len(rows) > 500:                      # downsample so mobile charts stay light
+        step = len(rows) // 500 + 1
+        rows = rows[::step]
+    return rows
 
 
 def usage_payload():
@@ -918,7 +997,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/status":
             self._json(status_payload())
         elif path == "/api/history":
-            self._json(history_payload())
+            q = parse_qs(urlparse(self.path).query)
+            try:
+                days = max(1, min(90, int(q.get("days", ["1"])[0])))
+            except ValueError:
+                days = 1
+            self._json(history_payload(days))
         elif path == "/api/usage":
             self._json(usage_payload())
         else:
@@ -950,6 +1034,7 @@ class Handler(BaseHTTPRequestHandler):
                 if form.get("warn"): kv_set("warn_remaining_l", max(0.0, float(form["warn"])))
                 if form.get("final"): kv_set("final_remaining_l", max(0.0, float(form["final"])))
                 if form.get("poll"): kv_set("poll_minutes", max(1.0, float(form["poll"])))
+                if form.get("gpl"): kv_set("liquid_cl_gpl", max(1.0, float(form["gpl"])))
                 for key in CFG_KEYS:
                     if key in form and form[key].strip() != "":
                         cfg_set(key, form[key].strip())
