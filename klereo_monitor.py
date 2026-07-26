@@ -121,8 +121,10 @@ def init_db():
     if kv_get("final_remaining_l") is None: kv_set("final_remaining_l", 0.5)
     if kv_get("notified_warn")    is None: kv_set("notified_warn", 0)
     if kv_get("notified_final")   is None: kv_set("notified_final", 0)
-    if kv_get("pump_kw")          is None: kv_set("pump_kw", 1.1)
-    if kv_get("price_kwh")        is None: kv_set("price_kwh", 0.25)
+    if kv_get("pump_kw")          is None: kv_set("pump_kw", 0.9)
+    if kv_get("price_kwh")        is None: kv_set("price_kwh", 0.182)   # day / peak
+    if kv_get("price_offpeak")    is None: kv_set("price_offpeak", 0.142)  # night / off-peak
+    if kv_get("offpeak_window")   is None: kv_set("offpeak_window", "22:00-06:00")
     if kv_get("currency")         is None: kv_set("currency", "€")
 
 
@@ -550,7 +552,7 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
   <canvas id="filterChart" height="120"></canvas>
   <div class="sub" id="filterSummary" style="margin-top:8px"></div>
  </div>
- <div class="panel" id="coverPanel">
+ <div class="panel" id="coverPanel" style="display:none">
   <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase;margin-bottom:6px">Pool cover</div>
   <div class="val" id="coverState" style="font-size:22px">-</div>
   <div class="sub" id="coverInfo" style="margin:4px 0 8px"></div>
@@ -589,20 +591,21 @@ async function load(){
    document.getElementById('bottleinfo').textContent='Tap "Register new bottle" to start tracking.';
  }
  // Pool cover (from the home camera bridge)
- const cs=document.getElementById('coverState'), ci=document.getElementById('coverInfo'), cimg=document.getElementById('coverImg');
+ const cp=document.getElementById('coverPanel');
  if(s.cover_ts){
+   cp.style.display='block';
+   const cs=document.getElementById('coverState'), ci=document.getElementById('coverInfo'), cimg=document.getElementById('coverImg');
    cs.textContent = s.cover_state ? s.cover_state.toUpperCase() : 'image received';
    cs.className = 'val '+(s.cover_state==='open'?'on':(s.cover_state==='closed'?'off':''));
    ci.textContent = 'updated '+relTime(s.cover_ts);
    cimg.src='/api/cover-latest.jpg?t='+Date.now(); cimg.style.display='block';
  } else {
-   cs.textContent='no data'; cs.className='val';
-   ci.textContent='Waiting for the home camera bridge...';
+   cp.style.display='none';   // hidden until the camera bridge is sending images
  }
  lastReading = r;
  drawChart();
  loadUsage();
- filterCfg={pump:(s.pump_kw||1.1), price:(s.price_kwh||0.25), cur:(s.currency||'')};
+ filterCfg={pump:(s.pump_kw||0.9), price:(s.price_kwh||0.182), priceOff:(s.price_offpeak||s.price_kwh||0.142), cur:(s.currency||'')};
  loadFilter();
 }
 function relTime(iso){
@@ -702,7 +705,7 @@ function drawUsage(){
  if(usageChart) usageChart.destroy();
  usageChart=new Chart(ctx,{type:'bar',data,options:opts});
 }
-let filterChart, filterPeriod='day', filterData=[], filterCfg={pump:1.1,price:0.25,cur:''};
+let filterChart, filterPeriod='day', filterData=[], filterCfg={pump:0.9,price:0.182,priceOff:0.142,cur:''};
 async function loadFilter(){
  try{ filterData = await (await fetch('/api/filter-usage')).json(); }catch(e){ filterData=[]; }
  drawFilter();
@@ -713,26 +716,28 @@ function setFilterPeriod(p){
  drawFilter();
 }
 function bucketFilter(){
- if(filterPeriod==='day') return filterData.slice(-30).map(d=>({label:d.date.slice(5), hours:d.hours}));
+ if(filterPeriod==='day') return filterData.slice(-30).map(d=>({label:d.date.slice(5), hours:d.hours, peak:d.peak_hours||0, off:d.offpeak_hours||0}));
  const map={};
  filterData.forEach(d=>{
    let key;
    if(filterPeriod==='month'){ key=d.date.slice(0,7); }
-   else { const dt=new Date(d.date+'T00:00:00'); const off=(dt.getDay()+6)%7;
-          const mon=new Date(dt); mon.setDate(dt.getDate()-off); key=mon.toISOString().slice(0,10); }
-   map[key]=(map[key]||0)+d.hours;
+   else { const dt=new Date(d.date+'T00:00:00'); const wd=(dt.getDay()+6)%7;
+          const mon=new Date(dt); mon.setDate(dt.getDate()-wd); key=mon.toISOString().slice(0,10); }
+   const m=map[key]||(map[key]={hours:0,peak:0,off:0});
+   m.hours+=d.hours; m.peak+=(d.peak_hours||0); m.off+=(d.offpeak_hours||0);
  });
  const keys=Object.keys(map).sort();
  const sliced = filterPeriod==='month'? keys.slice(-12) : keys.slice(-16);
- return sliced.map(k=>({label: filterPeriod==='week'? k.slice(5) : k, hours:+map[k].toFixed(1)}));
+ return sliced.map(k=>({label: filterPeriod==='week'? k.slice(5) : k, hours:+map[k].hours.toFixed(1), peak:map[k].peak, off:map[k].off}));
 }
 function drawFilter(){
  const b=bucketFilter();
  const totalH=b.reduce((s,x)=>s+x.hours,0);
- const cost=totalH*filterCfg.pump*filterCfg.price;
+ const tp=b.reduce((s,x)=>s+x.peak,0), to=b.reduce((s,x)=>s+x.off,0);
+ const cost=tp*filterCfg.pump*filterCfg.price + to*filterCfg.pump*filterCfg.priceOff;
  document.getElementById('filterSummary').textContent = b.length
    ? ('total shown: '+totalH.toFixed(1)+' h  ~ '+filterCfg.cur+cost.toFixed(2)
-      +'   ('+filterCfg.pump+' kW @ '+filterCfg.cur+filterCfg.price+'/kWh)')
+      +'   (peak '+tp.toFixed(1)+'h / off-peak '+to.toFixed(1)+'h)')
    : 'No filter data yet - builds up as the monitor runs (needs 2+ days).';
  const data={labels:b.map(x=>x.label), datasets:[{label:'hours', data:b.map(x=>x.hours), backgroundColor:'#38bdf8', borderRadius:4}]};
  const opts={responsive:true, plugins:{legend:{display:false}},
@@ -829,9 +834,11 @@ def config_html():
     final  = kv_get("final_remaining_l", 0.5)
     poll   = kv_get("poll_minutes", POLL_MINUTES)
     gpl    = kv_get("liquid_cl_gpl", 48.0)
-    pump   = kv_get("pump_kw", 1.1)
-    price  = kv_get("price_kwh", 0.25)
+    pump   = kv_get("pump_kw", 0.9)
+    price  = kv_get("price_kwh", 0.182)
+    priceoff = kv_get("price_offpeak", 0.142)
     import html as _h
+    offwin = _h.escape(str(kv_get("offpeak_window", "22:00-06:00")), quote=True)
     curr   = _h.escape(str(kv_get("currency", "EUR")), quote=True)
     port   = val("SMTP_PORT") or "587"
     head = ("""<!doctype html><html><head><meta charset="utf-8">
@@ -873,9 +880,11 @@ a{color:#93c5fd}
 </div>
 <div class="panel"><div class="lbl2">Filtration cost</div>
  <div class="setrow"><label>Pump power</label><span><input id="pump" type="number" step="0.1" value="{pump}"><span class="u">kW</span></span></div>
- <div class="setrow"><label>Electricity price</label><span><input id="price" type="number" step="0.01" value="{price}"><span class="u">/kWh</span></span></div>
+ <div class="setrow"><label>Day (peak) price</label><span><input id="price" type="number" step="0.001" value="{price}"><span class="u">/kWh</span></span></div>
+ <div class="setrow"><label>Night (off-peak) price</label><span><input id="price_off" type="number" step="0.001" value="{priceoff}"><span class="u">/kWh</span></span></div>
+ <div class="setrow"><label>Off-peak hours</label><span><input id="offwin" type="text" value="{offwin}" style="width:120px"></span></div>
  <div class="setrow"><label>Currency symbol</label><span><input id="currency" type="text" value="{curr}" style="width:60px"></span></div>
- <div class="hint">Used to estimate filter running costs. For a variable-speed pump, use an average kW.</div>
+ <div class="hint">Prices incl. VAT. Off-peak like "22:00-06:00" (comma-separate multiple). Flat tariff? Set both prices the same. Variable-speed pump? Use an average kW.</div>
 </div>
 <div class="panel"><div class="lbl2">Klereo account</div>
  <div class="setrow"><label>Login</label><input id="KLEREO_LOGIN" type="text" value="{val('KLEREO_LOGIN')}"></div>
@@ -913,7 +922,7 @@ async function postAction(url, body){
 }
 async function testEmail(){ showToast('Sending test email...'); const r=await postAction('/test-email'); showToast(r.message, r.ok); }
 async function saveConfig(){
- const ids=['bottle_l','warn','final','poll','gpl','pump','price','currency','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS'];
+ const ids=['bottle_l','warn','final','poll','gpl','pump','price','price_off','offwin','currency','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS'];
  const p=new URLSearchParams();
  ids.forEach(id=>{const el=document.getElementById(id); if(el && el.value!=='') p.append(id, el.value);});
  const r=await postAction('/config', p.toString()); showToast(r.message, r.ok);
@@ -938,8 +947,10 @@ def status_payload():
         "poll_minutes": kv_get("poll_minutes", POLL_MINUTES),
         "cover_ts": kv_get("cover_ts"),
         "cover_state": kv_get("cover_state"),
-        "pump_kw": kv_get("pump_kw", 1.1),
-        "price_kwh": kv_get("price_kwh", 0.25),
+        "pump_kw": kv_get("pump_kw", 0.9),
+        "price_kwh": kv_get("price_kwh", 0.182),
+        "price_offpeak": kv_get("price_offpeak", 0.142),
+        "offpeak_window": kv_get("offpeak_window", "22:00-06:00"),
         "currency": kv_get("currency", "EUR"),
     }
 
@@ -972,21 +983,66 @@ def raw_payload():
     return out
 
 
-def filter_usage_payload():
-    """Filtration hours per calendar day, from the filter output's run-time
-    odometer (day-end minus previous day-end). Returns [{date, hours}]."""
-    with db() as c:
-        rows = c.execute(
-            "SELECT date(ts) AS d, MAX(filt_total) AS ft FROM readings "
-            "WHERE filt_total IS NOT NULL GROUP BY d ORDER BY d").fetchall()
-    out, prev = [], None
-    for r in rows:
-        ft = r["ft"]
-        if ft is None:
+def _parse_windows(spec):
+    """'22:00-06:00' or comma-separated ranges -> list of (start_min, end_min)."""
+    wins = []
+    for part in str(spec or "").split(","):
+        part = part.strip()
+        if "-" not in part:
             continue
+        a, b = part.split("-", 1)
+        try:
+            ah, am = (int(x) for x in a.split(":"))
+            bh, bm = (int(x) for x in b.split(":"))
+            wins.append((ah * 60 + am, bh * 60 + bm))
+        except ValueError:
+            continue
+    return wins
+
+
+def _is_offpeak(dt, wins):
+    m = dt.hour * 60 + dt.minute
+    for s, e in wins:
+        if s <= e:
+            if s <= m < e:
+                return True
+        elif m >= s or m < e:      # window wraps past midnight
+            return True
+    return False
+
+
+def filter_usage_payload():
+    """Filtration hours per calendar day, split into peak / off-peak by when the
+    filter actually ran (from consecutive odometer readings + timestamps).
+    Returns [{date, hours, peak_hours, offpeak_hours}]."""
+    wins = _parse_windows(kv_get("offpeak_window", "22:00-06:00"))
+    with db() as c:
+        rows = c.execute("SELECT ts, filt_total FROM readings "
+                         "WHERE filt_total IS NOT NULL ORDER BY ts").fetchall()
+    agg = {}   # date -> [peak_seconds, offpeak_seconds]
+    prev = None
+    for r in rows:
+        try:
+            t = datetime.fromisoformat(r["ts"])
+        except (ValueError, TypeError):
+            prev = None
+            continue
+        ft = r["filt_total"]
         if prev is not None:
-            out.append({"date": r["d"], "hours": round(max((ft - prev) / 3600.0, 0), 2)})
-        prev = ft
+            pft, pt = prev
+            delta = (ft or 0) - (pft or 0)
+            if delta > 0:
+                mid = pt + (t - pt) / 2          # attribute to the interval midpoint
+                key = mid.date().isoformat()
+                bucket = agg.setdefault(key, [0.0, 0.0])
+                bucket[1 if _is_offpeak(mid, wins) else 0] += delta
+        prev = (ft, t)
+    out = []
+    for d in sorted(agg):
+        pk, off = agg[d]
+        out.append({"date": d, "peak_hours": round(pk / 3600.0, 2),
+                    "offpeak_hours": round(off / 3600.0, 2),
+                    "hours": round((pk + off) / 3600.0, 2)})
     return out[-120:]
 
 
@@ -1205,6 +1261,8 @@ class Handler(BaseHTTPRequestHandler):
                 if form.get("gpl"): kv_set("liquid_cl_gpl", max(1.0, float(form["gpl"])))
                 if form.get("pump"): kv_set("pump_kw", max(0.0, float(form["pump"])))
                 if form.get("price"): kv_set("price_kwh", max(0.0, float(form["price"])))
+                if form.get("price_off"): kv_set("price_offpeak", max(0.0, float(form["price_off"])))
+                if form.get("offwin") is not None: kv_set("offpeak_window", form["offwin"].strip())
                 if form.get("currency"): kv_set("currency", form["currency"][:4])
                 for key in CFG_KEYS:
                     if key in form and form[key].strip() != "":
