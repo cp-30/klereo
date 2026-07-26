@@ -69,6 +69,7 @@ APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
 
 DB_PATH      = os.environ.get("DB_PATH", os.path.join(
                    os.path.dirname(os.path.abspath(__file__)), "klereo_monitor.db"))
+COVER_IMG    = os.path.join(os.path.dirname(DB_PATH), "cover_latest.jpg")
 PORT         = int(os.environ.get("PORT", "8080"))
 POLL_MINUTES = float(os.environ.get("POLL_MINUTES", "15"))
 DASH_USER    = os.environ.get("DASH_USER", "admin")
@@ -518,6 +519,12 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
   <canvas id="usageChart" height="120"></canvas>
   <div class="sub" id="usageSummary" style="margin-top:8px"></div>
  </div>
+ <div class="panel" id="coverPanel">
+  <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase;margin-bottom:6px">Pool cover</div>
+  <div class="val" id="coverState" style="font-size:22px">-</div>
+  <div class="sub" id="coverInfo" style="margin:4px 0 8px"></div>
+  <img id="coverImg" style="width:100%;border-radius:8px;display:none" alt="">
+ </div>
 </div>
 <script>
 async function load(){
@@ -549,6 +556,17 @@ async function load(){
  } else {
    document.getElementById('used').textContent='no baseline';
    document.getElementById('bottleinfo').textContent='Tap "Register new bottle" to start tracking.';
+ }
+ // Pool cover (from the home camera bridge)
+ const cs=document.getElementById('coverState'), ci=document.getElementById('coverInfo'), cimg=document.getElementById('coverImg');
+ if(s.cover_ts){
+   cs.textContent = s.cover_state ? s.cover_state.toUpperCase() : 'image received';
+   cs.className = 'val '+(s.cover_state==='open'?'on':(s.cover_state==='closed'?'off':''));
+   ci.textContent = 'updated '+relTime(s.cover_ts);
+   cimg.src='/api/cover-latest.jpg?t='+Date.now(); cimg.style.display='block';
+ } else {
+   cs.textContent='no data'; cs.className='val';
+   ci.textContent='Waiting for the home camera bridge...';
  }
  lastReading = r;
  drawChart();
@@ -836,6 +854,8 @@ def status_payload():
         "notified_warn": kv_get("notified_warn"),
         "notified_final": kv_get("notified_final"),
         "poll_minutes": kv_get("poll_minutes", POLL_MINUTES),
+        "cover_ts": kv_get("cover_ts"),
+        "cover_state": kv_get("cover_state"),
     }
 
 
@@ -1025,12 +1045,35 @@ class Handler(BaseHTTPRequestHandler):
             self._json(usage_payload())
         elif path == "/api/raw":
             self._json(raw_payload())
+        elif path == "/api/cover-latest.jpg":
+            if os.path.exists(COVER_IMG):
+                with open(COVER_IMG, "rb") as fh:
+                    self._send(200, fh.read(), "image/jpeg")
+            else:
+                self._send(404, "no image yet")
         else:
             self._send(404, "not found")
 
     def do_POST(self):
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", "0") or 0)
+
+        # Binary image ingest from the home camera bridge (read raw bytes).
+        if path == "/api/cover-image":
+            if not self._authed():
+                return self._auth_challenge()
+            data = self.rfile.read(length) if length else b""
+            state = parse_qs(urlparse(self.path).query).get("state", [""])[0]
+            try:
+                with open(COVER_IMG, "wb") as fh:
+                    fh.write(data)
+                kv_set("cover_ts", now_iso())
+                if state:
+                    kv_set("cover_state", state)
+                return self._json({"ok": True, "bytes": len(data)})
+            except Exception as e:
+                return self._json({"ok": False, "message": str(e)})
+
         body = self.rfile.read(length).decode("utf-8") if length else ""
         form = {k: v[0] for k, v in parse_qs(body).items()}
 
