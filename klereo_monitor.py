@@ -110,13 +110,20 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
         c.execute("""CREATE TABLE IF NOT EXISTS readings (
             ts TEXT, total_time REAL, debit REAL, ph REAL, orp REAL,
-            temp REAL, salt REAL, filtration INTEGER, used_l REAL)""")
+            temp REAL, salt REAL, filtration INTEGER, used_l REAL, filt_total REAL)""")
+        # migrate older DBs that predate the filter-runtime column
+        cols = [r[1] for r in c.execute("PRAGMA table_info(readings)").fetchall()]
+        if "filt_total" not in cols:
+            c.execute("ALTER TABLE readings ADD COLUMN filt_total REAL")
     if kv_get("bottle_l")         is None: kv_set("bottle_l", DEF_BOTTLE)
     if kv_get("poll_minutes")     is None: kv_set("poll_minutes", POLL_MINUTES)
     if kv_get("warn_remaining_l") is None: kv_set("warn_remaining_l", 5.0)
     if kv_get("final_remaining_l") is None: kv_set("final_remaining_l", 0.5)
     if kv_get("notified_warn")    is None: kv_set("notified_warn", 0)
     if kv_get("notified_final")   is None: kv_set("notified_final", 0)
+    if kv_get("pump_kw")          is None: kv_set("pump_kw", 1.1)
+    if kv_get("price_kwh")        is None: kv_set("price_kwh", 0.25)
+    if kv_get("currency")         is None: kv_set("currency", "€")
 
 
 def kv_get(k, default=None):
@@ -227,6 +234,14 @@ def out_mode(pool, index):
     return None
 
 
+def out_total(pool, index):
+    """Lifetime run-time (seconds) of an output - the odometer we diff per day."""
+    for o in pool.get("outs") or []:
+        if o.get("index") == index:
+            return o.get("totalTime")
+    return None
+
+
 # --------------------------------------------------------------------------
 # Poll + alert
 # --------------------------------------------------------------------------
@@ -317,14 +332,18 @@ def poll_once():
         "salt_g": salt_g, "salt_ml": salt_ml,
         "filtration": out_status(pool, SCHED_FILTRE),
         "filt_mode": out_mode(pool, SCHED_FILTRE),
+        "filt_total": out_total(pool, SCHED_FILTRE),
         "treatment": out_status(pool, SCHED_TRAIT),
         "used_l": used,
         "suspended": pool.get("suspended"),
     }
     with db() as c:
-        c.execute("INSERT INTO readings VALUES (?,?,?,?,?,?,?,?,?)",
+        c.execute("INSERT INTO readings "
+                  "(ts,total_time,debit,ph,orp,temp,salt,filtration,used_l,filt_total) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?)",
                   (reading["ts"], total, debit, reading["ph"], reading["orp"],
-                   reading["temp"], reading["salt"], reading["filtration"], used))
+                   reading["temp"], reading["salt"], reading["filtration"], used,
+                   reading["filt_total"]))
     kv_set("last_reading", reading)
     kv_set("last_ok", now_iso())
     kv_set("last_error", None)
@@ -519,6 +538,18 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
   <canvas id="usageChart" height="120"></canvas>
   <div class="sub" id="usageSummary" style="margin-top:8px"></div>
  </div>
+ <div class="panel">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Filter runtime &amp; cost</div>
+    <div class="seg">
+      <button id="fsegDay" class="active" type="button" onclick="setFilterPeriod('day')">Day</button>
+      <button id="fsegWeek" type="button" onclick="setFilterPeriod('week')">Week</button>
+      <button id="fsegMonth" type="button" onclick="setFilterPeriod('month')">Month</button>
+    </div>
+  </div>
+  <canvas id="filterChart" height="120"></canvas>
+  <div class="sub" id="filterSummary" style="margin-top:8px"></div>
+ </div>
  <div class="panel" id="coverPanel">
   <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase;margin-bottom:6px">Pool cover</div>
   <div class="val" id="coverState" style="font-size:22px">-</div>
@@ -571,6 +602,8 @@ async function load(){
  lastReading = r;
  drawChart();
  loadUsage();
+ filterCfg={pump:(s.pump_kw||1.1), price:(s.price_kwh||0.25), cur:(s.currency||'')};
+ loadFilter();
 }
 function relTime(iso){
  if(!iso) return 'never';
@@ -669,6 +702,45 @@ function drawUsage(){
  if(usageChart) usageChart.destroy();
  usageChart=new Chart(ctx,{type:'bar',data,options:opts});
 }
+let filterChart, filterPeriod='day', filterData=[], filterCfg={pump:1.1,price:0.25,cur:''};
+async function loadFilter(){
+ try{ filterData = await (await fetch('/api/filter-usage')).json(); }catch(e){ filterData=[]; }
+ drawFilter();
+}
+function setFilterPeriod(p){
+ filterPeriod=p;
+ ['Day','Week','Month'].forEach(x=>document.getElementById('fseg'+x).classList.toggle('active', x.toLowerCase()===p));
+ drawFilter();
+}
+function bucketFilter(){
+ if(filterPeriod==='day') return filterData.slice(-30).map(d=>({label:d.date.slice(5), hours:d.hours}));
+ const map={};
+ filterData.forEach(d=>{
+   let key;
+   if(filterPeriod==='month'){ key=d.date.slice(0,7); }
+   else { const dt=new Date(d.date+'T00:00:00'); const off=(dt.getDay()+6)%7;
+          const mon=new Date(dt); mon.setDate(dt.getDate()-off); key=mon.toISOString().slice(0,10); }
+   map[key]=(map[key]||0)+d.hours;
+ });
+ const keys=Object.keys(map).sort();
+ const sliced = filterPeriod==='month'? keys.slice(-12) : keys.slice(-16);
+ return sliced.map(k=>({label: filterPeriod==='week'? k.slice(5) : k, hours:+map[k].toFixed(1)}));
+}
+function drawFilter(){
+ const b=bucketFilter();
+ const totalH=b.reduce((s,x)=>s+x.hours,0);
+ const cost=totalH*filterCfg.pump*filterCfg.price;
+ document.getElementById('filterSummary').textContent = b.length
+   ? ('total shown: '+totalH.toFixed(1)+' h  ~ '+filterCfg.cur+cost.toFixed(2)
+      +'   ('+filterCfg.pump+' kW @ '+filterCfg.cur+filterCfg.price+'/kWh)')
+   : 'No filter data yet - builds up as the monitor runs (needs 2+ days).';
+ const data={labels:b.map(x=>x.label), datasets:[{label:'hours', data:b.map(x=>x.hours), backgroundColor:'#38bdf8', borderRadius:4}]};
+ const opts={responsive:true, plugins:{legend:{display:false}},
+   scales:{y:{beginAtZero:true,title:{display:true,text:'h'},grid:{color:'#334155'}},
+           x:{ticks:{maxTicksLimit:10,color:'#94a3b8'},grid:{display:false}}}};
+ if(filterChart) filterChart.destroy();
+ filterChart=new Chart(document.getElementById('filterChart'),{type:'bar',data,options:opts});
+}
 let chart, chartRange=1, lastReading={};
 function setRange(d){
  chartRange=d;
@@ -757,6 +829,10 @@ def config_html():
     final  = kv_get("final_remaining_l", 0.5)
     poll   = kv_get("poll_minutes", POLL_MINUTES)
     gpl    = kv_get("liquid_cl_gpl", 48.0)
+    pump   = kv_get("pump_kw", 1.1)
+    price  = kv_get("price_kwh", 0.25)
+    import html as _h
+    curr   = _h.escape(str(kv_get("currency", "EUR")), quote=True)
     port   = val("SMTP_PORT") or "587"
     head = ("""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -795,6 +871,12 @@ a{color:#93c5fd}
  <div class="setrow"><label>Liquid Cl strength</label><span><input id="gpl" type="number" step="1" value="{gpl}"><span class="u">g/L</span></span></div>
  <div class="hint">Used to show the salt cell's output as a liquid-chlorine mL equivalent.</div>
 </div>
+<div class="panel"><div class="lbl2">Filtration cost</div>
+ <div class="setrow"><label>Pump power</label><span><input id="pump" type="number" step="0.1" value="{pump}"><span class="u">kW</span></span></div>
+ <div class="setrow"><label>Electricity price</label><span><input id="price" type="number" step="0.01" value="{price}"><span class="u">/kWh</span></span></div>
+ <div class="setrow"><label>Currency symbol</label><span><input id="currency" type="text" value="{curr}" style="width:60px"></span></div>
+ <div class="hint">Used to estimate filter running costs. For a variable-speed pump, use an average kW.</div>
+</div>
 <div class="panel"><div class="lbl2">Klereo account</div>
  <div class="setrow"><label>Login</label><input id="KLEREO_LOGIN" type="text" value="{val('KLEREO_LOGIN')}"></div>
  <div class="setrow"><label>Pool ID</label><input id="KLEREO_POOL_ID" type="text" value="{val('KLEREO_POOL_ID')}"></div>
@@ -831,7 +913,7 @@ async function postAction(url, body){
 }
 async function testEmail(){ showToast('Sending test email...'); const r=await postAction('/test-email'); showToast(r.message, r.ok); }
 async function saveConfig(){
- const ids=['bottle_l','warn','final','poll','gpl','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS'];
+ const ids=['bottle_l','warn','final','poll','gpl','pump','price','currency','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS'];
  const p=new URLSearchParams();
  ids.forEach(id=>{const el=document.getElementById(id); if(el && el.value!=='') p.append(id, el.value);});
  const r=await postAction('/config', p.toString()); showToast(r.message, r.ok);
@@ -856,6 +938,9 @@ def status_payload():
         "poll_minutes": kv_get("poll_minutes", POLL_MINUTES),
         "cover_ts": kv_get("cover_ts"),
         "cover_state": kv_get("cover_state"),
+        "pump_kw": kv_get("pump_kw", 1.1),
+        "price_kwh": kv_get("price_kwh", 0.25),
+        "currency": kv_get("currency", "EUR"),
     }
 
 
@@ -885,6 +970,24 @@ def raw_payload():
                 if pat.search(k):
                     out[f"{src}.{k}"] = v
     return out
+
+
+def filter_usage_payload():
+    """Filtration hours per calendar day, from the filter output's run-time
+    odometer (day-end minus previous day-end). Returns [{date, hours}]."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT date(ts) AS d, MAX(filt_total) AS ft FROM readings "
+            "WHERE filt_total IS NOT NULL GROUP BY d ORDER BY d").fetchall()
+    out, prev = [], None
+    for r in rows:
+        ft = r["ft"]
+        if ft is None:
+            continue
+        if prev is not None:
+            out.append({"date": r["d"], "hours": round(max((ft - prev) / 3600.0, 0), 2)})
+        prev = ft
+    return out[-120:]
 
 
 def usage_payload():
@@ -1043,6 +1146,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(history_payload(days))
         elif path == "/api/usage":
             self._json(usage_payload())
+        elif path == "/api/filter-usage":
+            self._json(filter_usage_payload())
         elif path == "/api/raw":
             self._json(raw_payload())
         elif path == "/api/cover-latest.jpg":
@@ -1098,6 +1203,9 @@ class Handler(BaseHTTPRequestHandler):
                 if form.get("final"): kv_set("final_remaining_l", max(0.0, float(form["final"])))
                 if form.get("poll"): kv_set("poll_minutes", max(1.0, float(form["poll"])))
                 if form.get("gpl"): kv_set("liquid_cl_gpl", max(1.0, float(form["gpl"])))
+                if form.get("pump"): kv_set("pump_kw", max(0.0, float(form["pump"])))
+                if form.get("price"): kv_set("price_kwh", max(0.0, float(form["price"])))
+                if form.get("currency"): kv_set("currency", form["currency"][:4])
                 for key in CFG_KEYS:
                     if key in form and form[key].strip() != "":
                         cfg_set(key, form[key].strip())
