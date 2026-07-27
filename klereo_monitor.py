@@ -385,6 +385,46 @@ def poll_once():
     return reading
 
 
+COMMAND_NAMES = {9: "done", 13: "not allowed for your account", 15: "pod timeout",
+                 17: "pod offline", 10: "error", 11: "bad parameter", 12: "unknown command"}
+
+
+def set_filtration(action):
+    """Drive the filter pump. action = 'on' (manual ON), 'off' (manual OFF),
+    'auto' (hand back to Regulated). Returns the final command status code."""
+    login = cfg_get("KLEREO_LOGIN"); password = cfg_get("KLEREO_PASSWORD")
+    if not login or not password:
+        raise KlereoError("Klereo credentials not set")
+    k = Klereo(); k.login(login, password)
+    pid = cfg_get("KLEREO_POOL_ID")
+    if not pid:
+        ids = k.pool_ids()
+        if len(ids) != 1:
+            raise KlereoError(f"Set KLEREO_POOL_ID (pools: {ids})")
+        pid = ids[0]
+    cur_status = out_status(k.pool(pid), SCHED_FILTRE) or 0
+    if action == "on":
+        nm, ns = 0, 1                      # MODE_MANU, on
+    elif action == "off":
+        nm, ns = 0, 0                      # MODE_MANU, off
+    elif action == "auto":
+        nm, ns = 3, (cur_status or 1)      # MODE_REGUL
+    else:
+        raise KlereoError("unknown action")
+    b = k._post("php/SetOut.php", {"poolID": pid, "outIdx": SCHED_FILTRE,
+                                   "newMode": nm, "newState": ns, "comMode": 1})
+    r = b.get("response")
+    cmd = r[0].get("cmdID") if isinstance(r, list) and r and isinstance(r[0], dict) else None
+    if cmd is None:
+        return None
+    for _ in range(8):
+        time.sleep(2)
+        st = (k._post("php/WaitCommand.php", {"cmdID": cmd}).get("response") or {}).get("status")
+        if st in (9, 10, 11, 12, 13, 15, 16, 17, 18, 19):
+            return st
+    return None
+
+
 def poller_loop():
     while True:
         try:
@@ -901,6 +941,14 @@ a{color:#93c5fd}
  <div class="hint">Gmail app password (16 chars). Leave blank to keep the current one.</div>
  <button class="ghost" type="button" onclick="testEmail()">Send test email</button>
 </div>
+<div class="panel"><div class="lbl2">Filtration control (test)</div>
+ <div class="hint" style="margin-top:0">Drive the pump directly. Start/Stop force it into manual; Regulated hands control back to Klereo. Each takes a few seconds.</div>
+ <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
+   <button type="button" onclick="filterCtl('on')">Start (manual)</button>
+   <button type="button" class="ghost" onclick="filterCtl('off')">Stop (manual)</button>
+   <button type="button" class="ghost" onclick="filterCtl('auto')">Regulated (auto)</button>
+ </div>
+</div>
 <button type="button" onclick="saveConfig()" style="width:100%;margin-top:14px">Save settings</button>
 <div class="hint" style="text-align:center;margin-top:8px">Saved on the server; secrets are never shown back here.</div>
 <div class="panel"><div class="lbl2">Diagnostics</div>
@@ -921,6 +969,7 @@ async function postAction(url, body){
  try{ const r=await fetch(url,opt); return await r.json(); }catch(e){ return {ok:false,message:'Network error'}; }
 }
 async function testEmail(){ showToast('Sending test email...'); const r=await postAction('/test-email'); showToast(r.message, r.ok); }
+async function filterCtl(a){ showToast('Sending filtration command...'); const r=await postAction('/api/filter-control','action='+a); showToast(r.message, r.ok); }
 async function saveConfig(){
  const ids=['bottle_l','warn','final','poll','gpl','pump','price','price_off','offwin','currency','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS'];
  const p=new URLSearchParams();
@@ -1272,6 +1321,21 @@ class Handler(BaseHTTPRequestHandler):
                 with _lock:
                     poll_once()
                 self._json({"ok": True, "message": "Updated from the controller."})
+            elif path == "/api/filter-control":
+                action = form.get("action", "")
+                try:
+                    with _lock:
+                        st = set_filtration(action)
+                    label = {"on": "Start", "off": "Stop", "auto": "Regulated"}.get(action, action)
+                    if st == 9:
+                        msg = f"Filtration -> {label}: done."
+                    elif st is None:
+                        msg = f"Filtration -> {label}: sent (result pending)."
+                    else:
+                        msg = f"Filtration -> {label}: {COMMAND_NAMES.get(st, 'code ' + str(st))}."
+                    self._json({"ok": st in (9, None), "message": msg})
+                except Exception as e:
+                    self._json({"ok": False, "message": f"Filtration failed: {e}"})
             elif path == "/test-email":
                 try:
                     ok = send_email("Klereo Monitor: test email",
