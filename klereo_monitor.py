@@ -111,21 +111,135 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS readings (
             ts TEXT, total_time REAL, debit REAL, ph REAL, orp REAL,
             temp REAL, salt REAL, filtration INTEGER, used_l REAL, filt_total REAL)""")
-        # migrate older DBs that predate the filter-runtime column
+        # migrate older DBs that predate later columns
         cols = [r[1] for r in c.execute("PRAGMA table_info(readings)").fetchall()]
         if "filt_total" not in cols:
             c.execute("ALTER TABLE readings ADD COLUMN filt_total REAL")
+        if "ph_total" not in cols:      # pH-pump lifetime odometer (seconds)
+            c.execute("ALTER TABLE readings ADD COLUMN ph_total REAL")
+        # bottle-change history (one row per fitted bottle, per chemical)
+        c.execute("""CREATE TABLE IF NOT EXISTS bottles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chem TEXT NOT NULL,          -- 'cl' (chlorine) or 'ph' (pH-minus)
+            fitted_at TEXT NOT NULL,     -- local ISO time the bottle was fitted
+            baseline REAL,               -- odometer value at fit (seconds)
+            factor REAL,                 -- litres per odometer-second at fit time
+            size_l REAL)""")
+    # chlorine defaults
     if kv_get("bottle_l")         is None: kv_set("bottle_l", DEF_BOTTLE)
     if kv_get("poll_minutes")     is None: kv_set("poll_minutes", POLL_MINUTES)
     if kv_get("warn_remaining_l") is None: kv_set("warn_remaining_l", 5.0)
     if kv_get("final_remaining_l") is None: kv_set("final_remaining_l", 0.5)
     if kv_get("notified_warn")    is None: kv_set("notified_warn", 0)
     if kv_get("notified_final")   is None: kv_set("notified_final", 0)
+    # pH-minus bottle defaults (mirrors chlorine)
+    if kv_get("ph_bottle_l")      is None: kv_set("ph_bottle_l", 20.0)
+    if kv_get("ph_warn_remaining_l")  is None: kv_set("ph_warn_remaining_l", 5.0)
+    if kv_get("ph_final_remaining_l") is None: kv_set("ph_final_remaining_l", 0.5)
+    if kv_get("ph_notified_warn")  is None: kv_set("ph_notified_warn", 0)
+    if kv_get("ph_notified_final") is None: kv_set("ph_notified_final", 0)
+    # pH dosing pump flow rate, litres/hour (user-calibrated against the app)
+    if kv_get("ph_pump_lph")      is None: kv_set("ph_pump_lph", 1.5)
     if kv_get("pump_kw")          is None: kv_set("pump_kw", 0.9)
     if kv_get("price_kwh")        is None: kv_set("price_kwh", 0.182)   # day / peak
     if kv_get("price_offpeak")    is None: kv_set("price_offpeak", 0.142)  # night / off-peak
     if kv_get("offpeak_window")   is None: kv_set("offpeak_window", "22:00-06:00")
-    if kv_get("currency")         is None: kv_set("currency", "€")
+    if kv_get("currency")         is None: kv_set("currency", "EUR")
+    # one-time migration: fold the old single chlorine baseline into bottles[]
+    _migrate_legacy_bottle()
+
+
+def _migrate_legacy_bottle():
+    if kv_get("bottles_migrated"):
+        return
+    base = kv_get("baseline_total_time")
+    if base is not None:
+        with db() as c:
+            n = c.execute("SELECT COUNT(*) AS n FROM bottles WHERE chem='cl'").fetchone()["n"]
+            if not n:
+                debit = kv_get("debit_at_baseline") or 15.0
+                c.execute("INSERT INTO bottles(chem,fitted_at,baseline,factor,size_l) "
+                          "VALUES('cl',?,?,?,?)",
+                          (kv_get("bottle_fitted_at") or now_iso(), base,
+                           float(debit) / 36000.0, float(kv_get("bottle_l", DEF_BOTTLE))))
+    kv_set("bottles_migrated", 1)
+
+
+# --- Bottle tracking, shared by chlorine ('cl') and pH-minus ('ph') -----------
+CHEM = {
+    "cl": {"name": "chlorine", "odo": "total_time",
+           "bottle_l": "bottle_l", "warn": "warn_remaining_l", "final": "final_remaining_l",
+           "nwarn": "notified_warn", "nfinal": "notified_final"},
+    "ph": {"name": "pH-minus", "odo": "ph_total",
+           "bottle_l": "ph_bottle_l", "warn": "ph_warn_remaining_l", "final": "ph_final_remaining_l",
+           "nwarn": "ph_notified_warn", "nfinal": "ph_notified_final"},
+}
+
+
+def _chem_odo(reading, chem):
+    """Current lifetime odometer (seconds) for the chemical from a reading dict."""
+    return (reading or {}).get(CHEM[chem]["odo"])
+
+
+def _chem_factor(chem):
+    """Litres of product per odometer-second, using the live rate.
+    chlorine: debit/36000 (debit ~15 -> 1.5 L/h). pH: pump L/h / 3600."""
+    if chem == "cl":
+        debit = (kv_get("last_reading") or {}).get("debit") or 15.0
+        return float(debit) / 36000.0
+    return float(kv_get("ph_pump_lph", 1.5)) / 3600.0
+
+
+def current_bottle(chem):
+    with db() as c:
+        r = c.execute("SELECT * FROM bottles WHERE chem=? "
+                      "ORDER BY fitted_at DESC, id DESC LIMIT 1", (chem,)).fetchone()
+    return dict(r) if r else None
+
+
+def bottle_used_l(chem, odo_now=None):
+    """Litres of product used from the current bottle (None if no bottle/odometer)."""
+    b = current_bottle(chem)
+    if not b or b.get("baseline") is None:
+        return None
+    if odo_now is None:
+        odo_now = _chem_odo(kv_get("last_reading"), chem)
+    if odo_now is None:
+        return None
+    factor = b.get("factor") or _chem_factor(chem)
+    return max((odo_now - b["baseline"]) * factor, 0.0)
+
+
+def bottle_history(chem):
+    """History rows newest-first: fitted/replaced time, size and litres used per bottle."""
+    with db() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM bottles WHERE chem=? ORDER BY fitted_at ASC, id ASC",
+            (chem,)).fetchall()]
+    odo_now = _chem_odo(kv_get("last_reading"), chem)
+    live = _chem_factor(chem)
+    out = []
+    for i, b in enumerate(rows):
+        factor = b.get("factor") or live
+        nxt = rows[i + 1] if i + 1 < len(rows) else None
+        end_odo = nxt["baseline"] if nxt else odo_now
+        litres = None
+        if b.get("baseline") is not None and end_odo is not None:
+            litres = round(max((end_odo - b["baseline"]) * factor, 0.0), 2)
+        out.append({"id": b["id"], "fitted_at": b["fitted_at"],
+                    "replaced_at": (nxt["fitted_at"] if nxt else None),
+                    "size_l": b.get("size_l"), "litres_used": litres,
+                    "current": nxt is None})
+    out.reverse()
+    return out
+
+
+def _resync_cl_legacy():
+    """Keep the old single-baseline kv in step with the current chlorine bottle
+    so the existing dashboard/alert fields stay correct after edits/deletes."""
+    b = current_bottle("cl")
+    kv_set("baseline_total_time", b["baseline"] if b else None)
+    kv_set("bottle_fitted_at", b["fitted_at"] if b else None)
 
 
 def kv_get(k, default=None):
@@ -295,6 +409,11 @@ def poll_once():
     total = float(total) if total is not None else None
     debit = float(debit) if debit is not None else None
 
+    # pH-minus dosing pump: lifetime run-time odometer (seconds), same shape as
+    # the filtration odometer. Usage is derived from run-time * configured L/h.
+    ph_total = out_total(pool, SCHED_PH)
+    ph_total = float(ph_total) if ph_total is not None else None
+
     baseline = kv_get("baseline_total_time")
     used = None
     if baseline is not None and total is not None and debit is not None:
@@ -335,54 +454,81 @@ def poll_once():
         "filtration": out_status(pool, SCHED_FILTRE),
         "filt_mode": out_mode(pool, SCHED_FILTRE),
         "filt_total": out_total(pool, SCHED_FILTRE),
+        "ph_total": ph_total,
         "treatment": out_status(pool, SCHED_TRAIT),
         "used_l": used,
         "suspended": pool.get("suspended"),
     }
     with db() as c:
         c.execute("INSERT INTO readings "
-                  "(ts,total_time,debit,ph,orp,temp,salt,filtration,used_l,filt_total) "
-                  "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  "(ts,total_time,debit,ph,orp,temp,salt,filtration,used_l,filt_total,ph_total) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                   (reading["ts"], total, debit, reading["ph"], reading["orp"],
                    reading["temp"], reading["salt"], reading["filtration"], used,
-                   reading["filt_total"]))
+                   reading["filt_total"], ph_total))
+    kv_set("last_reading", reading)          # so odometer lookups see this reading
+
+    # pH-minus usage (from the current pH bottle) + today's dosed mL
+    reading["used_ph"] = bottle_used_l("ph")
+    reading["ph_today_ml"] = today_dose_ml("ph")
     kv_set("last_reading", reading)
     kv_set("last_ok", now_iso())
     kv_set("last_error", None)
 
-    # Two-tier bottle alerts, by litres REMAINING:
-    #   warn  (e.g. 5 L left)   -> "check you have a spare"
-    #   final (e.g. 0.5 L left) -> "change the bottle now"
-    if used is not None:
-        bottle = float(kv_get("bottle_l", DEF_BOTTLE))
-        warn_rem  = float(kv_get("warn_remaining_l", 5.0))
-        final_rem = float(kv_get("final_remaining_l", 0.5))
-        remaining = bottle - used
-        pool_name = reading["nickname"]
-
-        def _alert(subject, body, flag):
-            try:
-                if send_email(subject, body):
-                    kv_set(flag, 1); kv_set(flag + "_at", now_iso())
-            except Exception as e:
-                print("[email] error:", e)
-
-        if remaining <= final_rem:
-            if not kv_get("notified_final"):
-                _alert("Klereo: CHANGE the chlorine bottle now",
-                       f"Your pool '{pool_name}' has ~{max(remaining,0):.1f} L of liquid "
-                       f"chlorine left (used {used:.1f} L of a {bottle:.0f} L bottle).\n\n"
-                       f"Change the bottle now. When you fit the new one, press "
-                       f"'New bottle fitted' on the dashboard.\n", "notified_final")
-                kv_set("notified_warn", 1)   # suppress the redundant earlier warning
-        elif remaining <= warn_rem:
-            if not kv_get("notified_warn"):
-                _alert("Klereo: chlorine getting low - check you have a spare",
-                       f"Your pool '{pool_name}' has ~{remaining:.1f} L of liquid chlorine "
-                       f"left (used {used:.1f} L of a {bottle:.0f} L bottle).\n\n"
-                       f"Make sure you have a spare 20 L bottle ready - you'll get a second "
-                       f"email when it's time to actually change it.\n", "notified_warn")
+    # Two-tier "litres remaining" alerts for each chemical bottle.
+    for chem in ("cl", "ph"):
+        try:
+            _check_bottle_alerts(chem, reading.get("nickname"))
+        except Exception as e:
+            print(f"[alert:{chem}] error:", e)
     return reading
+
+
+def today_dose_ml(chem):
+    """mL of product dosed so far today, from the odometer's within-day delta."""
+    col = CHEM[chem]["odo"]
+    today = datetime.now(timezone.utc).astimezone().date().isoformat()
+    with db() as c:
+        row = c.execute(f"SELECT MIN({col}) AS lo, MAX({col}) AS hi FROM readings "
+                        f"WHERE date(ts)=? AND {col} IS NOT NULL", (today,)).fetchone()
+    if not row or row["lo"] is None or row["hi"] is None:
+        return None
+    return max(row["hi"] - row["lo"], 0.0) * _chem_factor(chem) * 1000.0
+
+
+def _check_bottle_alerts(chem, pool_name):
+    meta = CHEM[chem]
+    used = bottle_used_l(chem)
+    if used is None:
+        return
+    size = float(kv_get(meta["bottle_l"]))
+    warn_rem  = float(kv_get(meta["warn"]))
+    final_rem = float(kv_get(meta["final"]))
+    remaining = size - used
+    label = meta["name"]
+
+    def _alert(subject, body, flag):
+        try:
+            if send_email(subject, body):
+                kv_set(flag, 1); kv_set(flag + "_at", now_iso())
+        except Exception as e:
+            print("[email] error:", e)
+
+    if remaining <= final_rem:
+        if not kv_get(meta["nfinal"]):
+            _alert(f"Klereo: CHANGE the {label} bottle now",
+                   f"Your pool '{pool_name}' has ~{max(remaining,0):.1f} L of {label} left "
+                   f"(used {used:.1f} L of a {size:.0f} L bottle).\n\n"
+                   f"Change the bottle now, then press 'Register new bottle' on the "
+                   f"dashboard.\n", meta["nfinal"])
+            kv_set(meta["nwarn"], 1)     # suppress the redundant earlier warning
+    elif remaining <= warn_rem:
+        if not kv_get(meta["nwarn"]):
+            _alert(f"Klereo: {label} getting low - check you have a spare",
+                   f"Your pool '{pool_name}' has ~{remaining:.1f} L of {label} left "
+                   f"(used {used:.1f} L of a {size:.0f} L bottle).\n\n"
+                   f"Make sure you have a spare bottle ready - you'll get a second email "
+                   f"when it's time to actually change it.\n", meta["nwarn"])
 
 
 COMMAND_NAMES = {9: "done", 13: "not allowed for your account", 15: "pod timeout",
@@ -491,6 +637,9 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
  .wrap{max-width:900px;margin:0 auto;padding:18px}
  h1{font-size:20px;margin:6px 0 2px} .sub{color:#94a3b8;font-size:13px;margin-bottom:14px}
  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+ .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+ .sect{color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin:18px 0 8px;font-weight:600}
+ .sect:first-of-type{margin-top:4px}
  .card{background:#1e293b;border-radius:12px;padding:14px}
  .card .lbl{color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
  .card .val{font-size:26px;font-weight:600;margin-top:4px}
@@ -524,7 +673,7 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
  <div id="ptr" style="position:fixed;top:0;left:0;right:0;text-align:center;padding:8px;color:#94a3b8;font-size:13px;transform:translateY(-40px);transition:transform .15s;z-index:6">&#8595; pull to refresh</div>
  <div id="toast" class="toast"></div>
  <div id="bottleModal" class="modal"><div class="modalcard">
-   <div style="font-size:16px;font-weight:600;margin-bottom:14px">Register new bottle</div>
+   <div style="font-size:16px;font-weight:600;margin-bottom:14px" id="bmTitle">Register new bottle</div>
    <label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="bmNow" checked onchange="bmToggle()"> Fitted now</label>
    <div id="bmWhen" style="margin-top:12px;display:none">
      <div style="font-size:13px;color:#94a3b8;margin-bottom:5px">Date &amp; time fitted (past only):</div>
@@ -535,27 +684,56 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
      <button type="button" onclick="confirmBottle()" style="flex:1">Confirm</button>
    </div>
  </div></div>
+ <div id="histModal" class="modal"><div class="modalcard" style="width:420px">
+   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+     <div style="font-size:16px;font-weight:600" id="histTitle">Bottle history</div>
+     <button type="button" class="ghost" style="padding:4px 10px" onclick="closeHistory()">Close</button>
+   </div>
+   <div id="histBody" style="max-height:60vh;overflow:auto">loading...</div>
+ </div></div>
  <div class="wrap">
  <a href="/config" title="Settings" style="position:fixed;top:10px;right:58px;z-index:5;font-size:22px;line-height:1;padding:6px 10px;text-decoration:none;color:#fff;background:#334155;border-radius:8px">&#9881;</a>
  <button id="refbtn" class="ghost" title="Refresh" style="position:fixed;top:10px;right:10px;z-index:5;font-size:18px;line-height:1;padding:8px 12px" onclick="refresh()">&#8635;</button>
  <h1 id="title"><img src="/apple-touch-icon.png" alt="">Pool Stats <span id="nick" style="font-size:14px;color:#94a3b8;font-weight:400"></span></h1>
  <div class="status" id="sub">loading...</div>
  <div id="err"></div>
+ <div class="sect">Live</div>
  <div class="grid">
   <div class="card"><div class="lbl">pH</div><div class="val" id="ph">-</div><div class="unit">target 6.6-8.0</div></div>
   <div class="card"><div class="lbl">ORP / Redox</div><div class="val" id="orp">-</div><div class="unit">mV</div></div>
   <div class="card"><div class="lbl">Water temp</div><div class="val" id="temp">-</div><div class="unit">&deg;C</div></div>
   <div class="card"><div class="lbl">Filtration</div><div class="val" id="filt">-</div><div class="unit" id="filtmode"></div></div>
-  <div class="card"><div class="lbl">Dosed today</div><div class="val" id="today">-</div><div class="unit">mL liquid Cl</div></div>
+ </div>
+ <div class="sect">Treatment today</div>
+ <div class="grid">
+  <div class="card"><div class="lbl">Chlorine dosed</div><div class="val" id="today">-</div><div class="unit">mL liquid Cl</div></div>
+  <div class="card"><div class="lbl">pH-minus dosed</div><div class="val" id="phtoday">-</div><div class="unit">mL today</div></div>
   <div class="card"><div class="lbl">Salt cell today</div><div class="val" id="saltgen">-</div><div class="unit" id="saltml"></div></div>
  </div>
- <div class="panel">
-  <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Liquid chlorine bottle</div>
-  <div class="val" style="font-size:30px;font-weight:700"><span id="used">-</span> <span class="unit">L used</span>
-     &nbsp; <span class="unit">/ <span id="rem">-</span> L left of <span id="bottle">-</span> L</span></div>
-  <div class="bar"><div id="barfill" style="width:0%"></div></div>
-  <div class="sub" id="bottleinfo" style="margin-top:10px"></div>
-  <button type="button" onclick="openBottle()"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6M10 2v3.5L7 9v11a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9l-3-3.5V2"/><path d="M7 13h10"/></svg>Register new bottle</button>
+ <div class="sect">Bottles</div>
+ <div class="grid2">
+  <div class="panel" style="margin-top:0">
+   <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Chlorine (liquid)</div>
+   <div class="val" style="font-size:26px;font-weight:700"><span id="used">-</span> <span class="unit">L used</span>
+      &nbsp;<span class="unit">/ <span id="rem">-</span> L left of <span id="bottle">-</span> L</span></div>
+   <div class="bar"><div id="barfill" style="width:0%"></div></div>
+   <div class="sub" id="bottleinfo" style="margin-top:10px"></div>
+   <div class="row" style="margin-top:12px">
+     <button type="button" onclick="openBottle('cl')"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6M10 2v3.5L7 9v11a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9l-3-3.5V2"/><path d="M7 13h10"/></svg>Register new</button>
+     <button type="button" class="ghost" onclick="openHistory('cl')">History</button>
+   </div>
+  </div>
+  <div class="panel" style="margin-top:0">
+   <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">pH-minus (liquid)</div>
+   <div class="val" style="font-size:26px;font-weight:700"><span id="used_ph">-</span> <span class="unit">L used</span>
+      &nbsp;<span class="unit">/ <span id="rem_ph">-</span> L left of <span id="bottle_ph">-</span> L</span></div>
+   <div class="bar"><div id="barfill_ph" style="width:0%"></div></div>
+   <div class="sub" id="bottleinfo_ph" style="margin-top:10px"></div>
+   <div class="row" style="margin-top:12px">
+     <button type="button" onclick="openBottle('ph')"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6M10 2v3.5L7 9v11a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9l-3-3.5V2"/><path d="M7 13h10"/></svg>Register new</button>
+     <button type="button" class="ghost" onclick="openHistory('ph')">History</button>
+   </div>
+  </div>
  </div>
  <div class="panel">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
@@ -569,12 +747,18 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
   <div style="position:relative;height:200px"><canvas id="chart"></canvas></div>
  </div>
  <div class="panel">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-    <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Chlorine used</div>
-    <div class="seg">
-      <button id="segDay" class="active" type="button" onclick="setUsage('day')">Day</button>
-      <button id="segWeek" type="button" onclick="setUsage('week')">Week</button>
-      <button id="segMonth" type="button" onclick="setUsage('month')">Month</button>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
+    <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Product used</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <div class="seg">
+        <button id="uchemcl" class="active" type="button" onclick="setUsageChem('cl')">Chlorine</button>
+        <button id="uchemph" type="button" onclick="setUsageChem('ph')">pH-minus</button>
+      </div>
+      <div class="seg">
+        <button id="segDay" class="active" type="button" onclick="setUsage('day')">Day</button>
+        <button id="segWeek" type="button" onclick="setUsage('week')">Week</button>
+        <button id="segMonth" type="button" onclick="setUsage('month')">Month</button>
+      </div>
     </div>
   </div>
   <canvas id="usageChart" height="120"></canvas>
@@ -609,7 +793,7 @@ async function load(){
     + (s.notified_final ? '  |  CHANGE-BOTTLE alert sent' : (s.notified_warn ? '  |  low-chlorine alert sent' : ''));
  document.getElementById('err').innerHTML = s.last_error ? '<div class="err">Last error: '+s.last_error+'</div>' : '';
  const set=(id,v,d)=>document.getElementById(id).textContent=(v==null?'-':(typeof v==='number'?v.toFixed(d):v));
- set('temp', r.temp, 1); set('today', r.today_ml, 0);
+ set('temp', r.temp, 1); set('today', r.today_ml, 0); set('phtoday', r.ph_today_ml, 0);
  setZone('ph', r.ph, r.ph_min, r.ph_max, 2);
  setZone('orp', r.orp, r.orp_min, r.orp_max, 0);
  set('saltgen', r.salt_g, 1);
@@ -618,18 +802,9 @@ async function load(){
  if(r.filtration==null){f.textContent='-';f.className='val';}
  else{f.textContent=r.filtration? 'ON':'OFF'; f.className='val '+(r.filtration?'on':'off');}
  document.getElementById('filtmode').textContent = modeName(r.filt_mode);
- document.getElementById('bottle').textContent=(s.bottle_l==null?'-':s.bottle_l);
- if(r.used_l!=null){
-   const used=r.used_l, bottle=s.bottle_l||20, rem=Math.max(bottle-used,0);
-   document.getElementById('used').textContent=used.toFixed(1);
-   document.getElementById('rem').textContent=rem.toFixed(1);
-   document.getElementById('barfill').style.width=Math.max(0,100-used/bottle*100)+'%';
-   document.getElementById('bottleinfo').textContent=
-      'fitted '+relTime(s.bottle_fitted_at)+'   |   alerts at '+s.warn_remaining_l+' L and '+s.final_remaining_l+' L left';
- } else {
-   document.getElementById('used').textContent='no baseline';
-   document.getElementById('bottleinfo').textContent='Tap "Register new bottle" to start tracking.';
- }
+ fillBottle('', r.used_l, s.bottle_l, s.bottle_fitted_at, s.warn_remaining_l, s.final_remaining_l);
+ fillBottle('_ph', (r.used_ph!=null? r.used_ph : s.used_ph), s.ph_bottle_l,
+            s.ph_bottle_fitted_at, s.ph_warn_remaining_l, s.ph_final_remaining_l);
  // Pool cover (from the home camera bridge)
  const cp=document.getElementById('coverPanel');
  if(s.cover_ts){
@@ -688,7 +863,26 @@ async function postAction(url, body){
 function localNowStr(){ const d=new Date(); const p=n=>String(n).padStart(2,'0');
  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes()); }
 function bmToggle(){ document.getElementById('bmWhen').style.display=document.getElementById('bmNow').checked?'none':'block'; }
-function openBottle(){
+const CHEMNAME={cl:'chlorine', ph:'pH-minus'};
+function fillBottle(sfx, used, size, fitted, warn, final){
+ document.getElementById('bottle'+sfx).textContent=(size==null?'-':size);
+ if(used!=null){
+   const rem=Math.max(size-used,0);
+   document.getElementById('used'+sfx).textContent=used.toFixed(1);
+   document.getElementById('rem'+sfx).textContent=rem.toFixed(1);
+   document.getElementById('barfill'+sfx).style.width=Math.max(0,100-used/size*100)+'%';
+   document.getElementById('bottleinfo'+sfx).textContent='fitted '+relTime(fitted)+'   |   alerts at '+warn+' L and '+final+' L left';
+ } else {
+   document.getElementById('used'+sfx).textContent='no baseline';
+   document.getElementById('rem'+sfx).textContent='-';
+   document.getElementById('barfill'+sfx).style.width='0%';
+   document.getElementById('bottleinfo'+sfx).textContent='Tap "Register new" to start tracking.';
+ }
+}
+let bmChem='cl';
+function openBottle(chem){
+ bmChem=chem||'cl';
+ document.getElementById('bmTitle').textContent='Register new '+CHEMNAME[bmChem]+' bottle';
  document.getElementById('bmNow').checked=true;
  const t=document.getElementById('bmTime'); t.value=localNowStr(); t.max=localNowStr();
  bmToggle();
@@ -696,26 +890,90 @@ function openBottle(){
 }
 function closeBottle(){ document.getElementById('bottleModal').classList.remove('show'); }
 async function confirmBottle(){
- let body='';
+ let body='chem='+bmChem;
  if(!document.getElementById('bmNow').checked){
    const t=document.getElementById('bmTime').value;
    if(!t){ showToast('Pick a date and time.', false); return; }
    const chosen=new Date(t).getTime();
    if(chosen>Date.now()){ showToast('Date must be in the past.', false); return; }
-   body='at_ms='+chosen;
+   body+='&at_ms='+chosen;
  }
  closeBottle();
  const r=await postAction('/new-bottle', body); showToast(r.message, r.ok); load();
 }
-let usageChart, usagePeriod='day', usageData=[];
+// ---- Bottle history modal ----
+let histChem='cl';
+function openHistory(chem){
+ histChem=chem||'cl';
+ const nm=CHEMNAME[histChem];
+ document.getElementById('histTitle').textContent=nm.charAt(0).toUpperCase()+nm.slice(1)+' bottle history';
+ document.getElementById('histBody').innerHTML='loading...';
+ document.getElementById('histModal').classList.add('show');
+ renderHistory();
+}
+function closeHistory(){ document.getElementById('histModal').classList.remove('show'); }
+function fmtDur(a,b){
+ const start=new Date(a), end=b?new Date(b):new Date();
+ if(isNaN(start)) return '';
+ const days=Math.max(0,Math.round((end-start)/86400000));
+ return days+' day'+(days===1?'':'s');
+}
+async function renderHistory(){
+ let rows=[];
+ try{ rows=await (await fetch('/api/bottles?chem='+histChem)).json(); }catch(e){}
+ const body=document.getElementById('histBody');
+ body.innerHTML = rows.length ? rows.map(rowHtml).join('') : '<div class="sub">No bottles recorded yet.</div>';
+}
+function rowHtml(b){
+ const dur=fmtDur(b.fitted_at, b.replaced_at);
+ const used=(b.litres_used==null?'-':b.litres_used.toFixed(1)+' L');
+ const tag=b.current?'<span class="on" style="font-size:11px"> (current)</span>':'';
+ return '<div class="histrow" data-id="'+b.id+'" style="border-top:1px solid #334155;padding:10px 0">'
+  +'<div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline">'
+  +'<div><b>'+relTime(b.fitted_at)+'</b>'+tag
+  +'<div class="sub">lasted '+dur+'  |  used '+used+' of '+(b.size_l==null?'-':b.size_l+' L')+'</div></div>'
+  +'<div class="row" style="margin:0">'
+  +'<button type="button" class="ghost" style="padding:5px 9px" onclick="histEdit('+b.id+',\''+(b.fitted_at||'')+'\','+(b.size_l||0)+')">Edit</button>'
+  +'<button type="button" class="ghost" style="padding:5px 9px;background:#7f1d1d" onclick="histDelete('+b.id+')">Delete</button>'
+  +'</div></div></div>';
+}
+function isoToLocalInput(iso){ const d=new Date(iso); if(isNaN(d)) return localNowStr(); const p=n=>String(n).padStart(2,'0');
+ return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes()); }
+function histEdit(id, iso, size){
+ const row=document.querySelector('.histrow[data-id="'+id+'"]'); if(!row) return;
+ row.innerHTML='<div style="padding:4px 0">'
+  +'<div class="sub" style="margin-bottom:4px">Date &amp; time fitted (past only):</div>'
+  +'<input type="datetime-local" id="he_time_'+id+'" value="'+isoToLocalInput(iso)+'" max="'+localNowStr()+'" style="width:100%;box-sizing:border-box;background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:8px;font-size:14px">'
+  +'<div class="row" style="margin-top:6px"><label style="margin:0">Size</label><input type="number" step="1" id="he_size_'+id+'" value="'+(size||'')+'" style="width:80px"><span class="sub">L</span></div>'
+  +'<div class="row" style="margin-top:10px"><button type="button" onclick="histSave('+id+')">Save</button>'
+  +'<button type="button" class="ghost" onclick="renderHistory()">Cancel</button></div></div>';
+}
+async function histSave(id){
+ const t=document.getElementById('he_time_'+id).value;
+ const sz=document.getElementById('he_size_'+id).value;
+ let body='id='+id;
+ if(t){ const ms=new Date(t).getTime(); if(ms>Date.now()){ showToast('Date must be in the past.',false); return;} body+='&at_ms='+ms; }
+ if(sz) body+='&size_l='+sz;
+ const r=await postAction('/api/bottle-edit', body); showToast(r.message, r.ok); renderHistory(); load();
+}
+async function histDelete(id){
+ const r=await postAction('/api/bottle-delete', 'id='+id); showToast(r.message, r.ok); renderHistory(); load();
+}
+let usageChart, usagePeriod='day', usageChem='cl', usageData=[];
 async function loadUsage(){
- try{ usageData = await (await fetch('/api/usage')).json(); }catch(e){ usageData=[]; }
+ try{ usageData = await (await fetch('/api/usage?chem='+usageChem)).json(); }catch(e){ usageData=[]; }
  drawUsage();
 }
 function setUsage(p){
  usagePeriod=p;
  ['Day','Week','Month'].forEach(x=>document.getElementById('seg'+x).classList.toggle('active', x.toLowerCase()===p));
  drawUsage();
+}
+function setUsageChem(c){
+ usageChem=c;
+ document.getElementById('uchemcl').classList.toggle('active', c==='cl');
+ document.getElementById('uchemph').classList.toggle('active', c==='ph');
+ loadUsage();
 }
 function bucketUsage(){
  if(usagePeriod==='day') return usageData.slice(-30).map(d=>({label:d.date.slice(5), litres:d.litres}));
@@ -734,11 +992,13 @@ function bucketUsage(){
 function drawUsage(){
  const b=bucketUsage();
  const total=b.reduce((s,x)=>s+x.litres,0);
+ const nm=usageChem==='ph'?'pH-minus':'chlorine';
  document.getElementById('usageSummary').textContent = b.length
-   ? ('total shown: '+total.toFixed(1)+' L   |   latest '+usagePeriod+': '+b[b.length-1].litres.toFixed(2)+' L')
+   ? (nm+' - total shown: '+total.toFixed(1)+' L   |   latest '+usagePeriod+': '+b[b.length-1].litres.toFixed(2)+' L')
    : 'No usage data yet - this builds up as the monitor runs (needs 2+ days).';
  const ctx=document.getElementById('usageChart');
- const data={labels:b.map(x=>x.label), datasets:[{label:'L used', data:b.map(x=>x.litres), backgroundColor:'#f59e0b', borderRadius:4}]};
+ const color=usageChem==='ph'?'#f472b6':'#f59e0b';
+ const data={labels:b.map(x=>x.label), datasets:[{label:'L used', data:b.map(x=>x.litres), backgroundColor:color, borderRadius:4}]};
  const opts={responsive:true, plugins:{legend:{display:false}},
    scales:{y:{beginAtZero:true,title:{display:true,text:'L'},grid:{color:'#334155'}},
            x:{ticks:{maxTicksLimit:10,color:'#94a3b8'},grid:{display:false}}}};
@@ -872,6 +1132,10 @@ def config_html():
     bottle = kv_get("bottle_l", DEF_BOTTLE)
     warn   = kv_get("warn_remaining_l", 5.0)
     final  = kv_get("final_remaining_l", 0.5)
+    ph_bottle = kv_get("ph_bottle_l", 20.0)
+    ph_warn   = kv_get("ph_warn_remaining_l", 5.0)
+    ph_final  = kv_get("ph_final_remaining_l", 0.5)
+    ph_pump   = kv_get("ph_pump_lph", 1.5)
     poll   = kv_get("poll_minutes", POLL_MINUTES)
     gpl    = kv_get("liquid_cl_gpl", 48.0)
     pump   = kv_get("pump_kw", 0.9)
@@ -910,13 +1174,20 @@ a{color:#93c5fd}
 <a href="/">&larr; Dashboard</a>
 <h1>Settings</h1>""")
     fields = f"""
-<div class="panel"><div class="lbl2">Alerts &amp; polling</div>
+<div class="panel"><div class="lbl2">Chlorine bottle &amp; polling</div>
  <div class="setrow"><label>Bottle size</label><span><input id="bottle_l" type="number" step="1" value="{bottle}"><span class="u">L</span></span></div>
  <div class="setrow"><label>1st alert at</label><span><input id="warn" type="number" step="0.5" value="{warn}"><span class="u">L left</span></span></div>
  <div class="setrow"><label>Final alert at</label><span><input id="final" type="number" step="0.1" value="{final}"><span class="u">L left</span></span></div>
  <div class="setrow"><label>Check every</label><span><input id="poll" type="number" step="1" min="1" value="{poll}"><span class="u">min</span></span></div>
  <div class="setrow"><label>Liquid Cl strength</label><span><input id="gpl" type="number" step="1" value="{gpl}"><span class="u">g/L</span></span></div>
  <div class="hint">Used to show the salt cell's output as a liquid-chlorine mL equivalent.</div>
+</div>
+<div class="panel"><div class="lbl2">pH-minus bottle</div>
+ <div class="setrow"><label>Bottle size</label><span><input id="ph_bottle_l" type="number" step="1" value="{ph_bottle}"><span class="u">L</span></span></div>
+ <div class="setrow"><label>1st alert at</label><span><input id="ph_warn" type="number" step="0.5" value="{ph_warn}"><span class="u">L left</span></span></div>
+ <div class="setrow"><label>Final alert at</label><span><input id="ph_final" type="number" step="0.1" value="{ph_final}"><span class="u">L left</span></span></div>
+ <div class="setrow"><label>pH pump flow</label><span><input id="ph_pump_lph" type="number" step="0.1" value="{ph_pump}"><span class="u">L/h</span></span></div>
+ <div class="hint">pH usage = pump run-time x this flow rate. Calibrate it so "pH dosed today" matches the Klereo app, then usage &amp; alerts stay accurate.</div>
 </div>
 <div class="panel"><div class="lbl2">Filtration cost</div>
  <div class="setrow"><label>Pump power</label><span><input id="pump" type="number" step="0.1" value="{pump}"><span class="u">kW</span></span></div>
@@ -971,7 +1242,7 @@ async function postAction(url, body){
 async function testEmail(){ showToast('Sending test email...'); const r=await postAction('/test-email'); showToast(r.message, r.ok); }
 async function filterCtl(a){ showToast('Sending filtration command...'); const r=await postAction('/api/filter-control','action='+a); showToast(r.message, r.ok); }
 async function saveConfig(){
- const ids=['bottle_l','warn','final','poll','gpl','pump','price','price_off','offwin','currency','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS'];
+ const ids=['bottle_l','warn','final','ph_bottle_l','ph_warn','ph_final','ph_pump_lph','poll','gpl','pump','price','price_off','offwin','currency','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS'];
  const p=new URLSearchParams();
  ids.forEach(id=>{const el=document.getElementById(id); if(el && el.value!=='') p.append(id, el.value);});
  const r=await postAction('/config', p.toString()); showToast(r.message, r.ok);
@@ -982,6 +1253,7 @@ async function saveConfig(){
 
 
 def status_payload():
+    ph_b = current_bottle("ph")
     return {
         "reading": kv_get("last_reading"),
         "last_ok": kv_get("last_ok"),
@@ -993,6 +1265,15 @@ def status_payload():
         "bottle_fitted_at": kv_get("bottle_fitted_at"),
         "notified_warn": kv_get("notified_warn"),
         "notified_final": kv_get("notified_final"),
+        # pH-minus bottle
+        "ph_bottle_l": kv_get("ph_bottle_l", 20.0),
+        "ph_warn_remaining_l": kv_get("ph_warn_remaining_l", 5.0),
+        "ph_final_remaining_l": kv_get("ph_final_remaining_l", 0.5),
+        "ph_bottle_fitted_at": (ph_b["fitted_at"] if ph_b else None),
+        "ph_notified_warn": kv_get("ph_notified_warn"),
+        "ph_notified_final": kv_get("ph_notified_final"),
+        "ph_pump_lph": kv_get("ph_pump_lph", 1.5),
+        "used_ph": bottle_used_l("ph"),
         "poll_minutes": kv_get("poll_minutes", POLL_MINUTES),
         "cover_ts": kv_get("cover_ts"),
         "cover_state": kv_get("cover_state"),
@@ -1022,7 +1303,8 @@ def raw_payload():
     field really tracks salt-cell production. Filtered to keep the dump small."""
     p = kv_get("last_params") or {}
     e = kv_get("last_extra") or {}
-    pat = re.compile(r"(elec|chlor|salt|sel|prod|hyb|trait|redox|orp|couv|cover|conso)", re.I)
+    pat = re.compile(r"(elec|chlor|salt|sel|prod|hyb|trait|redox|orp|couv|cover|conso|"
+                     r"\bph\b|ph_|_ph|pompe|debit|acid|correc|volet|dose)", re.I)
     out = {}
     for src, vals in (("params", p), ("ExtraParams", e)):
         if isinstance(vals, dict):
@@ -1095,73 +1377,154 @@ def filter_usage_payload():
     return out[-120:]
 
 
-def usage_payload():
-    """Chlorine used per calendar day, derived from the lifetime odometer.
-    litres(reading) = total_time * debit / 36000; daily use = day-end minus
-    previous day-end. Returns [{date, litres}] oldest->newest (last 120 days)."""
+def usage_payload(chem="cl"):
+    """Product used per calendar day, derived from the lifetime odometer.
+    chlorine: total_time * debit / 36000; pH: ph_total * pump_L/h / 3600.
+    Daily use = day-end minus previous day-end. Returns [{date, litres}]."""
+    if chem not in CHEM:
+        chem = "cl"
+    col = CHEM[chem]["odo"]
     with db() as c:
-        rows = c.execute(
-            "SELECT date(ts) AS d, MAX(total_time) AS tt, "
-            "       (SELECT debit FROM readings r2 WHERE date(r2.ts)=date(r1.ts) "
-            "        AND debit IS NOT NULL ORDER BY ts DESC LIMIT 1) AS debit "
-            "FROM readings r1 WHERE total_time IS NOT NULL "
-            "GROUP BY d ORDER BY d").fetchall()
+        if chem == "cl":
+            rows = c.execute(
+                "SELECT date(ts) AS d, MAX(total_time) AS tt, "
+                "       (SELECT debit FROM readings r2 WHERE date(r2.ts)=date(r1.ts) "
+                "        AND debit IS NOT NULL ORDER BY ts DESC LIMIT 1) AS debit "
+                "FROM readings r1 WHERE total_time IS NOT NULL "
+                "GROUP BY d ORDER BY d").fetchall()
+        else:
+            rows = c.execute(
+                f"SELECT date(ts) AS d, MAX({col}) AS tt FROM readings "
+                f"WHERE {col} IS NOT NULL GROUP BY d ORDER BY d").fetchall()
+    rate = float(kv_get("ph_pump_lph", 1.5))
     out, prev = [], None
     for r in rows:
-        tt, debit = r["tt"], r["debit"]
-        if tt is None or debit is None:
+        tt = r["tt"]
+        if tt is None:
             continue
-        cum = tt * debit / 36000.0
+        if chem == "cl":
+            debit = r["debit"]
+            if debit is None:
+                continue
+            cum = tt * debit / 36000.0
+        else:
+            cum = tt * rate / 3600.0
         if prev is not None:
             out.append({"date": r["d"], "litres": round(max(cum - prev, 0), 3)})
         prev = cum
     return out[-120:]
 
 
-def do_new_bottle(at_ms=None):
-    """Register a new bottle. at_ms (epoch ms) backdates the baseline to the
-    odometer reading nearest that time; None means 'now'."""
+def _odo_at(chem, at_ms):
+    """(odometer, debit, fitted_iso) nearest to a past time; None target -> now."""
+    col = CHEM[chem]["odo"]
     if at_ms is None:
         r = kv_get("last_reading") or {}
-        total = r.get("total_time")
-        if total is None:
+        odo = r.get(col)
+        if odo is None:
             with _lock:
                 r = poll_once()
-            total = r.get("total_time")
-        debit = r.get("debit")
-        fitted = now_iso()
-    else:
-        target = at_ms / 1000.0
-        with db() as c:
-            rows = c.execute("SELECT ts,total_time,debit FROM readings "
-                             "WHERE total_time IS NOT NULL ORDER BY ts").fetchall()
-        chosen = None
-        for row in rows:
-            try:
-                ep = datetime.fromisoformat(row["ts"]).timestamp()
-            except ValueError:
-                continue
-            if ep <= target:
-                chosen = row
-            else:
-                break
-        if chosen is None:
-            chosen = rows[0] if rows else None
-        if chosen is None:               # no history at all -> fall back to now
-            return do_new_bottle(None)
-        total = chosen["total_time"]; debit = chosen["debit"]
-        fitted = datetime.fromtimestamp(target).astimezone().isoformat(timespec="minutes")
-    kv_set("baseline_total_time", total)
-    kv_set("debit_at_baseline", debit)
-    kv_set("bottle_fitted_at", fitted)
-    kv_set("notified_warn", 0)
-    kv_set("notified_final", 0)
-    # Re-poll so the dashboard immediately reflects usage against the new baseline
+            odo = r.get(col)
+        return odo, r.get("debit"), now_iso()
+    target = at_ms / 1000.0
+    with db() as c:
+        rows = c.execute(f"SELECT ts,{col} AS odo,debit FROM readings "
+                         f"WHERE {col} IS NOT NULL ORDER BY ts").fetchall()
+    chosen = None
+    for row in rows:
+        try:
+            ep = datetime.fromisoformat(row["ts"]).timestamp()
+        except ValueError:
+            continue
+        if ep <= target:
+            chosen = row
+        else:
+            break
+    if chosen is None:
+        chosen = rows[0] if rows else None
+    if chosen is None:
+        return None, None, None
+    fitted = datetime.fromtimestamp(target).astimezone().isoformat(timespec="minutes")
+    return chosen["odo"], chosen["debit"], fitted
+
+
+def _factor_for(chem, debit):
+    if chem == "cl":
+        return (float(debit) / 36000.0) if debit is not None else (15.0 / 36000.0)
+    return float(kv_get("ph_pump_lph", 1.5)) / 3600.0
+
+
+def do_new_bottle(chem="cl", at_ms=None, size_l=None):
+    """Register a new bottle for a chemical. at_ms (epoch ms) backdates to the
+    odometer reading nearest that time; None means 'now'."""
+    if chem not in CHEM:
+        chem = "cl"
+    odo, debit, fitted = _odo_at(chem, at_ms)
+    if odo is None:                       # no history at all -> use now
+        if at_ms is not None:
+            return do_new_bottle(chem, None, size_l)
+        return
+    factor = _factor_for(chem, debit)
+    size = float(size_l) if size_l is not None else float(kv_get(CHEM[chem]["bottle_l"]))
+    with db() as c:
+        c.execute("INSERT INTO bottles(chem,fitted_at,baseline,factor,size_l) "
+                  "VALUES(?,?,?,?,?)", (chem, fitted, odo, factor, size))
+    kv_set(CHEM[chem]["nwarn"], 0)
+    kv_set(CHEM[chem]["nfinal"], 0)
+    if chem == "cl":
+        kv_set("baseline_total_time", odo)
+        kv_set("debit_at_baseline", debit)
+        kv_set("bottle_fitted_at", fitted)
     try:
         with _lock:
             poll_once()
     except Exception:
         pass
+
+
+def edit_bottle(bid, at_ms=None, size_l=None):
+    """Change a bottle's fitted date (recomputing its baseline) and/or size."""
+    with db() as c:
+        row = c.execute("SELECT * FROM bottles WHERE id=?", (bid,)).fetchone()
+        if not row:
+            return False
+        chem = row["chem"]
+    updates = {}
+    if at_ms is not None:
+        odo, debit, fitted = _odo_at(chem, at_ms)
+        if fitted is not None:
+            updates["fitted_at"] = fitted
+            if odo is not None:
+                updates["baseline"] = odo
+                updates["factor"] = _factor_for(chem, debit)
+    if size_l is not None:
+        updates["size_l"] = float(size_l)
+    if updates:
+        sets = ",".join(f"{k}=?" for k in updates)
+        with db() as c:
+            c.execute(f"UPDATE bottles SET {sets} WHERE id=?", (*updates.values(), bid))
+    if chem == "cl":
+        _resync_cl_legacy()
+    try:
+        with _lock:
+            poll_once()
+    except Exception:
+        pass
+    return True
+
+
+def delete_bottle(bid):
+    with db() as c:
+        row = c.execute("SELECT chem FROM bottles WHERE id=?", (bid,)).fetchone()
+        c.execute("DELETE FROM bottles WHERE id=?", (bid,))
+    if row and row["chem"] == "cl":
+        _resync_cl_legacy()
+    try:
+        with _lock:
+            poll_once()
+    except Exception:
+        pass
+    return True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1250,7 +1613,13 @@ class Handler(BaseHTTPRequestHandler):
                 days = 1
             self._json(history_payload(days))
         elif path == "/api/usage":
-            self._json(usage_payload())
+            q = parse_qs(urlparse(self.path).query)
+            chem = q.get("chem", ["cl"])[0]
+            self._json(usage_payload(chem))
+        elif path == "/api/bottles":
+            q = parse_qs(urlparse(self.path).query)
+            chem = q.get("chem", ["cl"])[0]
+            self._json(bottle_history(chem if chem in CHEM else "cl"))
         elif path == "/api/filter-usage":
             self._json(filter_usage_payload())
         elif path == "/api/raw":
@@ -1299,13 +1668,34 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/new-bottle":
                 at = form.get("at_ms")
-                do_new_bottle(int(at) if at else None)
+                chem = form.get("chem", "cl")
+                chem = chem if chem in CHEM else "cl"
+                size = form.get("size_l")
+                do_new_bottle(chem, int(at) if at else None,
+                              float(size) if size else None)
                 self._json({"ok": True, "message":
-                            "New bottle recorded" + (" (backdated)." if at else ".")})
+                            f"New {CHEM[chem]['name']} bottle recorded"
+                            + (" (backdated)." if at else ".")})
+            elif path == "/api/bottle-edit":
+                bid = int(form["id"])
+                at = form.get("at_ms")
+                size = form.get("size_l")
+                ok = edit_bottle(bid, int(at) if at else None,
+                                 float(size) if size else None)
+                self._json({"ok": bool(ok),
+                            "message": "Bottle updated." if ok else "Bottle not found."})
+            elif path == "/api/bottle-delete":
+                bid = int(form["id"])
+                delete_bottle(bid)
+                self._json({"ok": True, "message": "Bottle removed."})
             elif path == "/config":
                 if form.get("bottle_l"): kv_set("bottle_l", float(form["bottle_l"]))
                 if form.get("warn"): kv_set("warn_remaining_l", max(0.0, float(form["warn"])))
                 if form.get("final"): kv_set("final_remaining_l", max(0.0, float(form["final"])))
+                if form.get("ph_bottle_l"): kv_set("ph_bottle_l", float(form["ph_bottle_l"]))
+                if form.get("ph_warn"): kv_set("ph_warn_remaining_l", max(0.0, float(form["ph_warn"])))
+                if form.get("ph_final"): kv_set("ph_final_remaining_l", max(0.0, float(form["ph_final"])))
+                if form.get("ph_pump_lph"): kv_set("ph_pump_lph", max(0.0, float(form["ph_pump_lph"])))
                 if form.get("poll"): kv_set("poll_minutes", max(1.0, float(form["poll"])))
                 if form.get("gpl"): kv_set("liquid_cl_gpl", max(1.0, float(form["gpl"])))
                 if form.get("pump"): kv_set("pump_kw", max(0.0, float(form["pump"])))
