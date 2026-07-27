@@ -928,19 +928,21 @@ function rowHtml(b){
  const dur=fmtDur(b.fitted_at, b.replaced_at);
  const used=(b.litres_used==null?'-':b.litres_used.toFixed(1)+' L');
  const tag=b.current?'<span class="on" style="font-size:11px"> (current)</span>':'';
- return '<div class="histrow" data-id="'+b.id+'" style="border-top:1px solid #334155;padding:10px 0">'
+ const iso=(b.fitted_at||'').replace(/"/g,'');
+ return '<div class="histrow" data-id="'+b.id+'" data-iso="'+iso+'" data-size="'+(b.size_l||'')+'" style="border-top:1px solid #334155;padding:10px 0">'
   +'<div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline">'
   +'<div><b>'+relTime(b.fitted_at)+'</b>'+tag
   +'<div class="sub">lasted '+dur+'  |  used '+used+' of '+(b.size_l==null?'-':b.size_l+' L')+'</div></div>'
   +'<div class="row" style="margin:0">'
-  +'<button type="button" class="ghost" style="padding:5px 9px" onclick="histEdit('+b.id+',\''+(b.fitted_at||'')+'\','+(b.size_l||0)+')">Edit</button>'
+  +'<button type="button" class="ghost" style="padding:5px 9px" onclick="histEdit('+b.id+')">Edit</button>'
   +'<button type="button" class="ghost" style="padding:5px 9px;background:#7f1d1d" onclick="histDelete('+b.id+')">Delete</button>'
   +'</div></div></div>';
 }
 function isoToLocalInput(iso){ const d=new Date(iso); if(isNaN(d)) return localNowStr(); const p=n=>String(n).padStart(2,'0');
  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes()); }
-function histEdit(id, iso, size){
+function histEdit(id){
  const row=document.querySelector('.histrow[data-id="'+id+'"]'); if(!row) return;
+ const iso=row.dataset.iso||''; const size=row.dataset.size||'';
  row.innerHTML='<div style="padding:4px 0">'
   +'<div class="sub" style="margin-bottom:4px">Date &amp; time fitted (past only):</div>'
   +'<input type="datetime-local" id="he_time_'+id+'" value="'+isoToLocalInput(iso)+'" max="'+localNowStr()+'" style="width:100%;box-sizing:border-box;background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:8px;font-size:14px">'
