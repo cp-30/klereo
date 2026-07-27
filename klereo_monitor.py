@@ -64,6 +64,8 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
+APP_VERSION = "1.0.0"          # bump on every change; shown at bottom of Settings
+
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
 
@@ -433,6 +435,7 @@ def poll_once():
     # the configurable liquid strength (g active Cl per litre).
     kv_set("last_params", params)      # kept for /api/raw diagnostics
     kv_set("last_extra", extra)
+    kv_set("last_outs", pool.get("outs") or [])   # for identifying the pH pump output
     salt_g = params.get("Elec_GramDone")
     salt_g = float(salt_g) if salt_g is not None else None
     gpl = float(kv_get("liquid_cl_gpl", 48.0))
@@ -1228,6 +1231,7 @@ a{color:#93c5fd}
  <a href="/api/raw" target="_blank">View raw Klereo chemistry fields (/api/raw)</a>
  <div class="hint">Handy for checking values like the salt cell (Elec_GramDone).</div>
 </div>
+<div style="text-align:center;color:#64748b;font-size:12px;margin:18px 0 8px">Pool Stats v{APP_VERSION}</div>
 """
     tail = ("""
 </div><script>
@@ -1313,6 +1317,9 @@ def raw_payload():
             for k, v in vals.items():
                 if pat.search(k):
                     out[f"{src}.{k}"] = v
+    # Full outputs list, so we can identify which output is the pH dosing pump
+    # and how its run-time (totalTime/todayTime) is reported.
+    out["outs"] = kv_get("last_outs") or []
     return out
 
 
