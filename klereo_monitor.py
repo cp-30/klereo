@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.5.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.6.0"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -943,7 +943,6 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,san
 .qsub{font-size:11.5px;margin-top:4px}
 .qsub .w{font-weight:700}
 .qage{font-size:10px;color:var(--muted);margin-top:3px}
-.qbar{height:4px;border-radius:3px;margin-top:9px}
 .chip .dot{width:38px;height:38px;border-radius:50%;margin:0 auto 7px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px}
 .chip .v{font-size:20px;font-weight:800;letter-spacing:-.5px}
 .chip .s{font-size:11px;font-weight:700;margin-top:1px}
@@ -1014,15 +1013,18 @@ a{color:var(--primary)}
 @media (min-width:800px){
  .app{max-width:1080px;padding-bottom:104px}
  .top{padding:22px 22px 6px}
- .wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:14px;align-items:start;padding:8px 20px}
+ .wrap{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start;padding:8px 20px}
  .wrap>.card{margin-bottom:0}
  .wrap>.sect{grid-column:1/-1;margin:12px 4px 0}
- .wrap>.span,.wrap>.bottles,.wrap>#alertsBody,.wrap>#balanceSect{grid-column:1/-1}
+ .wrap>.span,.wrap>.bottles,.wrap>#alertsBody,.wrap>#wqCard{grid-column:1/-1}
  .wrap>.bottles{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
- #balanceSect .card,#balanceSect{margin-bottom:0}
+ /* row 2: metric chart + balance share the row at matching height */
+ #detailCard,#balanceSect{align-self:stretch}
+ #balanceSect{display:flex;flex-direction:column;margin-bottom:0}
+ #balanceCard{flex:1;display:flex;flex-direction:column;justify-content:center;margin-bottom:0}
  #errbox{max-width:1080px;margin:0 auto}
  .tabbar{max-width:660px;border-radius:16px 16px 0 0}
- .wq{grid-template-columns:repeat(2,1fr)}
+ .wq{grid-template-columns:repeat(4,1fr)}
 }
 </style></head><body>
 <div id="toast" class="toast"></div>
@@ -1139,7 +1141,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.5.0</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.6.0</div>
  </div></div>
 
  <div class="tabbar">
@@ -1248,7 +1250,7 @@ function buildWQ(){var m=metrics();var order=['orp','ph','cl','temp'];
     +'<div class="qval">'+val+(unit?('<small>'+unit+'</small>'):'')+'</div>'
     +'<div class="qsub"><span class="w" style="color:'+col+'">'+si.txt+'</span>'+(rng?(' <span class="mut">&middot; '+rng+'</span>'):'')+'</div>'
     +(age?('<div class="qage">'+age+'</div>'):'')
-    +'<div class="qbar" style="background:'+(si.sc?col:'var(--line)')+'"></div></div>';
+    +'</div>';
  }).join('');
  if(!curDetail)curDetail='orp';}
 // ---------- balance (slow lab-tested chemistry) ----------
