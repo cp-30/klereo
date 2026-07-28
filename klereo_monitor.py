@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "1.1.1"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.0.0"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -162,6 +162,8 @@ def init_db():
     if kv_get("price_offpeak")    is None: kv_set("price_offpeak", 0.142)  # night / off-peak
     if kv_get("offpeak_window")   is None: kv_set("offpeak_window", "22:00-06:00")
     if kv_get("currency")         is None: kv_set("currency", "EUR")
+    # bottle forecast: days of history to average consumption over
+    if kv_get("bottle_avg_days") is None: kv_set("bottle_avg_days", 14)
     # PoolLab / LabCom lab-test sync
     if kv_get("labcom_poll_hours") is None: kv_set("labcom_poll_hours", 1.0)
     # re-key any lab rows stored before a parameter was added to LAB_PARAMS
@@ -264,6 +266,40 @@ def _resync_cl_legacy():
     b = current_bottle("cl")
     kv_set("baseline_total_time", b["baseline"] if b else None)
     kv_set("bottle_fitted_at", b["fitted_at"] if b else None)
+
+
+def bottle_forecast(chem):
+    """Remaining-focused view of a bottle + a consumption-based lifetime forecast.
+    Average is taken over the last `bottle_avg_days` days (or as many as exist)."""
+    from datetime import timedelta
+    size = float(kv_get(CHEM[chem]["bottle_l"]))
+    avg_days = int(kv_get("bottle_avg_days", 14) or 14)
+    out = {"size": size, "remaining": None, "pct": None, "used_today": None,
+           "avg_per_day": None, "days_left": None, "est_empty": None,
+           "avg_days": avg_days, "fitted_at": None}
+    b = current_bottle(chem)
+    if b:
+        out["fitted_at"] = b.get("fitted_at")
+    used = bottle_used_l(chem)
+    if used is None:
+        return out
+    remaining = max(size - used, 0.0)
+    out["remaining"] = remaining
+    out["pct"] = max(0.0, min(100.0, (remaining / size * 100.0))) if size > 0 else None
+    tml = today_dose_ml(chem)
+    out["used_today"] = (tml / 1000.0) if tml is not None else None
+    # average daily consumption from per-day usage over the window
+    daily = usage_payload(chem)
+    recent = daily[-avg_days:] if daily else []
+    if recent:
+        avg = sum(d["litres"] for d in recent) / len(recent)
+        out["avg_per_day"] = avg
+        if avg > 0:
+            days_left = remaining / avg
+            out["days_left"] = days_left
+            est = datetime.now(timezone.utc).astimezone() + timedelta(days=days_left)
+            out["est_empty"] = est.date().isoformat()
+    return out
 
 
 def kv_get(k, default=None):
@@ -636,15 +672,63 @@ LAB_DEFAULT_RANGES = {
 }
 
 
+LAB_TARGET_FIELDS = [("ph", "pH"), ("fc", "Free chlorine"), ("tc", "Total chlorine"),
+                     ("cc", "Combined chlorine"), ("cya", "Cyanuric acid (CYA)"),
+                     ("alk", "Total alkalinity"), ("ch", "Calcium hardness")]
+
+
 def _lab_range(key, api_low, api_high):
-    """Effective (low, high): the LabCom ideal if actually set, else a default.
-    LabCom uses -1 / 'NOT SET' when no range is configured."""
+    """Effective (low, high) target band, in priority order:
+    1) a range the user set in our Settings (kv 'lab_range_<key>'),
+    2) the LabCom ideal if it's actually configured (not -1),
+    3) a sensible built-in default."""
+    u = kv_get("lab_range_" + key)
+    if (isinstance(u, (list, tuple)) and len(u) == 2
+            and u[0] is not None and u[1] is not None and u[0] < u[1]):
+        return float(u[0]), float(u[1])
+
     def _ok(x):
         return x is not None and x > -0.5
     if _ok(api_low) and _ok(api_high) and api_low < api_high:
         return api_low, api_high
-    lo, hi = LAB_DEFAULT_RANGES.get(key, (None, None))
-    return lo, hi
+    return LAB_DEFAULT_RANGES.get(key, (None, None))
+
+
+def _latest_lab_value(param_key):
+    with db() as c:
+        r = c.execute("SELECT value FROM lab_tests WHERE param_key=? AND value IS NOT NULL "
+                      "ORDER BY ts DESC LIMIT 1", (param_key,)).fetchone()
+    return r["value"] if r else None
+
+
+# Recommended re-test cadence per parameter (days). Editable in Settings.
+LAB_CADENCE_DEFAULTS = {"ph": 7, "fc": 7, "tc": 7, "cc": 14,
+                        "cya": 30, "alk": 30, "ch": 30}
+
+
+def _lab_cadence(key):
+    v = kv_get("lab_cadence_" + key)
+    if v is not None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
+    return LAB_CADENCE_DEFAULTS.get(key)
+
+
+# Editable target bands for the live Klereo tiles.
+LIVE_RANGE_DEFAULTS = {"ph": (7.0, 7.6), "orp": (600.0, 800.0), "temp": (26.0, 30.0)}
+
+
+def _live_range(key, seuil_min=None, seuil_max=None):
+    """Effective (low, high) for a live tile: user override > Klereo seuils > default."""
+    u = kv_get("live_range_" + key)
+    if (isinstance(u, (list, tuple)) and len(u) == 2
+            and u[0] is not None and u[1] is not None and u[0] < u[1]):
+        return float(u[0]), float(u[1])
+    if seuil_min is not None and seuil_max is not None and seuil_min < seuil_max:
+        return float(seuil_min), float(seuil_max)
+    return LIVE_RANGE_DEFAULTS.get(key, (None, None))
 
 
 def _param_meta(parameter):
@@ -812,544 +896,473 @@ ICON_PNG = b64decode(
  "vAjmCIFTOqTyX/attpjX2lJjKc8Xu1ViGbUbcXq29vyp1n1Dxm4/WwjYjbnVbHxKUvuGt6t10W3GbEfjo9j7"
  "lqnnXZrPbQ/fixvha3Xrczf3OBD62Xu6d/waR27vgYdrrdgAAAABJRU5ErkJggg==")
 
-PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+PAGE = b"""<!doctype html><html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="icon" href="/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="Pool Stats">
-<meta name="theme-color" content="#0f172a">
+<meta name="theme-color" content="#eef2f7">
 <title>Pool Stats</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
- body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
- .wrap{max-width:900px;margin:0 auto;padding:18px}
- h1{font-size:20px;margin:6px 0 2px} .sub{color:#94a3b8;font-size:13px;margin-bottom:14px}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
- .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
- .sect{color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin:18px 0 8px;font-weight:600}
- .sect:first-of-type{margin-top:4px}
- .card{background:#1e293b;border-radius:12px;padding:14px}
- .card .lbl{color:#94a3b8;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
- .card .val{font-size:26px;font-weight:600;margin-top:4px}
- .card .unit{font-size:14px;color:#94a3b8}
- .on{color:#4ade80} .off{color:#f87171}
- .ok{color:#4ade80} .warn{color:#fbbf24} .bad{color:#f87171}
- .status{font-size:15px;color:#cbd5e1;margin-bottom:14px}
- h1 img{width:28px;height:28px;vertical-align:middle;border-radius:6px;margin-right:9px}
- button svg{vertical-align:-3px;margin-right:7px}
- .bar{position:relative;height:14px;background:linear-gradient(90deg,#22c55e,#eab308,#ef4444);border-radius:8px;overflow:hidden;margin-top:8px}
- .bar>div{position:absolute;top:0;right:0;height:100%;background:#334155}
- .panel{background:#1e293b;border-radius:12px;padding:16px;margin-top:16px}
- button{background:#2563eb;color:#fff;border:0;border-radius:8px;padding:9px 14px;font-size:14px;cursor:pointer}
- button.ghost{background:#334155}
- input{background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:7px;width:90px}
- label{font-size:13px;color:#cbd5e1;margin-right:6px}
- .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px}
- .setrow{display:flex;justify-content:space-between;align-items:center;margin:10px 0}
- .setrow label{margin:0} .setrow input{width:70px;text-align:right} .setrow .u{color:#94a3b8;margin-left:6px}
- .err{background:#7f1d1d;color:#fecaca;padding:8px 12px;border-radius:8px;margin-top:12px;font-size:13px}
- .toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(80px);background:#1e293b;border:1px solid #334155;color:#e2e8f0;padding:12px 18px;border-radius:10px;font-size:14px;box-shadow:0 8px 24px rgba(0,0,0,.45);opacity:0;transition:all .25s;z-index:30;max-width:90%;text-align:center}
- .toast.show{transform:translateX(-50%) translateY(0);opacity:1}
- .toast.ok{border-color:#16a34a} .toast.bad{border-color:#dc2626}
- .seg{display:inline-flex;background:#0f172a;border:1px solid #334155;border-radius:8px;overflow:hidden}
- .seg button{background:transparent;color:#cbd5e1;border:0;padding:6px 12px;font-size:13px;cursor:pointer}
- .seg button.active{background:#2563eb;color:#fff}
- .modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:40;padding:20px}
- .modal.show{display:flex}
- .modalcard{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:20px;width:320px;max-width:100%}
+:root{--bg:#eef2f7;--card:#fff;--card2:#f5f8fc;--text:#0f172a;--muted:#64748b;--line:#e6ebf2;
+ --shadow:0 6px 20px rgba(15,23,42,.06);--primary:#2563eb;--primarybg:#eaf1ff;
+ --ok:#16a34a;--okbg:#e7f6ec;--warn:#d97706;--warnbg:#fdf3e3;--bad:#dc2626;--badbg:#fbe9e9;
+ --ph:#3b82f6;--cl:#22c55e;--orp:#f59e0b;--temp:#8b5cf6}
+[data-theme="dark"]{--bg:#0b1220;--card:#131c2e;--card2:#0f1830;--text:#e8eef7;--muted:#93a1b8;--line:#233149;
+ --shadow:0 8px 24px rgba(0,0,0,.4);--primary:#3b82f6;--primarybg:#16233f;
+ --ok:#4ade80;--okbg:#12331f;--warn:#fbbf24;--warnbg:#33280f;--bad:#f87171;--badbg:#3a1717;
+ --ph:#60a5fa;--cl:#4ade80;--orp:#fbbf24;--temp:#a78bfa}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);transition:background .3s,color .3s}
+.app{max-width:480px;margin:0 auto;min-height:100vh;padding:0 0 96px;position:relative}
+.top{display:flex;align-items:center;justify-content:space-between;padding:18px 16px 4px}
+.top h1{font-size:21px;margin:0;letter-spacing:-.3px}
+.top .sub{color:var(--muted);font-size:12.5px;margin-top:2px}
+.iconbtn{width:38px;height:38px;border-radius:12px;border:0;background:var(--card);box-shadow:var(--shadow);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer}
+.wrap{padding:6px 15px}
+.sect{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin:16px 4px 9px}
+.card{background:var(--card);border-radius:18px;box-shadow:var(--shadow);padding:16px;margin-bottom:12px}
+.cardhead{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.cardhead .t{display:flex;align-items:center;gap:8px;font-weight:700;font-size:15px}
+.cardhead .t svg{color:var(--primary)}
+.mut{color:var(--muted)}
+.wq{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.chip{background:var(--card2);border-radius:14px;padding:11px 4px;text-align:center;cursor:pointer;border:2px solid transparent;transition:border-color .15s}
+.chip.sel{border-color:var(--primary)}
+.chip .dot{width:38px;height:38px;border-radius:50%;margin:0 auto 7px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px}
+.chip .v{font-size:20px;font-weight:800;letter-spacing:-.5px}
+.chip .s{font-size:11px;font-weight:700;margin-top:1px}
+.chip .age{color:var(--muted);font-size:9.5px;margin-top:5px;padding-top:5px;border-top:1px solid var(--line)}
+.s.ok{color:var(--ok)} .s.warn{color:var(--warn)} .s.bad{color:var(--bad)}
+.detail{display:flex;align-items:center;gap:14px}
+.detail .big{font-size:28px;font-weight:800;letter-spacing:-1px}
+.detail .big small{font-size:14px;color:var(--muted);font-weight:600}
+.detail .lab{font-size:13px;font-weight:700}
+.spark{flex:1;min-width:0;height:60px}
+.bottles{display:grid;grid-template-columns:1fr;gap:12px}
+.bottle{display:flex;gap:14px;align-items:center}
+.bottle .info{flex:1;min-width:0}
+.bhead{display:flex;align-items:center;gap:7px;margin-bottom:2px}
+.bname{font-weight:800;font-size:14px}
+.pct{font-weight:800;font-size:13px;padding:3px 10px;border-radius:999px;margin-left:auto}
+.pct.ok{background:var(--okbg);color:var(--ok)} .pct.warn{background:var(--warnbg);color:var(--warn)} .pct.bad{background:var(--badbg);color:var(--bad)}
+.rem{font-size:27px;font-weight:800;letter-spacing:-1px;margin-top:3px}
+.rem small{font-size:13px;color:var(--muted);font-weight:600}
+.row2{font-size:14px;font-weight:700;margin-top:5px}
+.divider{height:1px;background:var(--line);margin:11px 0}
+.statcols{display:flex;gap:16px}
+.stat{display:flex;align-items:center;gap:8px}
+.stat svg{color:var(--muted);flex:0 0 auto}
+.stat b{font-size:14px;display:block;line-height:1.15}
+.stat span{color:var(--muted);font-size:11px}
+.btns{display:flex;gap:9px;margin-top:12px}
+.btn{flex:1;border:0;border-radius:11px;padding:11px;font-size:14px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px}
+.btn.p{background:var(--primary);color:#fff}
+.btn.s{background:var(--card2);color:var(--text);border:1px solid var(--line)}
+.chartbox{height:150px;display:flex;align-items:flex-end;gap:5px}
+.seg{display:inline-flex;background:var(--card2);border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.seg button{background:transparent;color:var(--muted);border:0;padding:6px 11px;font-size:12.5px;cursor:pointer;font-weight:600}
+.seg button.active{background:var(--primary);color:#fff}
+.grow{display:flex;justify-content:space-between;align-items:center;padding:11px 2px;border-top:1px solid var(--line);gap:10px}
+.grow:first-child{border-top:0}
+.grow .k{color:var(--muted);font-size:13px}
+.grow .v{font-weight:700}
+.pill2{font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;background:var(--badbg);color:var(--bad);text-transform:uppercase}
+.alert{display:flex;gap:12px;align-items:flex-start;padding:14px;border-radius:15px;margin-bottom:10px;background:var(--card);box-shadow:var(--shadow)}
+.alert .ai{width:36px;height:36px;border-radius:11px;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+.ai.bad{background:var(--badbg);color:var(--bad)} .ai.warn{background:var(--warnbg);color:var(--warn)} .ai.info{background:var(--primarybg);color:var(--primary)}
+.alert .at{font-weight:700;font-size:14px}
+.alert .ad{color:var(--muted);font-size:12.5px;margin-top:2px}
+.tabbar{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);display:flex;max-width:480px;margin:0 auto;padding:8px 6px calc(8px + env(safe-area-inset-bottom));box-shadow:0 -4px 20px rgba(15,23,42,.06)}
+.tab{flex:1;background:none;border:0;color:var(--muted);display:flex;flex-direction:column;align-items:center;gap:3px;font-size:11px;font-weight:600;cursor:pointer;padding:6px 0;position:relative}
+.tab.active{color:var(--primary)}
+.tab .badge{position:absolute;top:-1px;right:calc(50% - 22px);background:var(--bad);color:#fff;font-size:10px;font-weight:800;min-width:16px;height:16px;border-radius:8px;display:flex;align-items:center;justify-content:center;padding:0 4px}
+.page{display:none} .page.active{display:block}
+input{background:var(--card2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px;font-size:14px}
+.toast{position:fixed;left:50%;bottom:104px;transform:translateX(-50%) translateY(80px);background:var(--card);border:1px solid var(--line);color:var(--text);padding:11px 17px;border-radius:11px;font-size:14px;box-shadow:var(--shadow);opacity:0;transition:all .25s;z-index:60;max-width:90%;text-align:center}
+.toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+.toast.ok{border-color:var(--ok)} .toast.bad{border-color:var(--bad)}
+.modal{position:fixed;inset:0;background:rgba(15,23,42,.55);display:none;align-items:center;justify-content:center;z-index:70;padding:18px}
+.modal.show{display:flex}
+.modalcard{background:var(--card);border-radius:16px;padding:18px;width:360px;max-width:100%}
+.err{background:var(--badbg);color:var(--bad);padding:9px 12px;border-radius:10px;font-size:13px;margin:8px 0}
+a{color:var(--primary)}
+.liquid{transition:transform 1.2s cubic-bezier(.25,.9,.3,1)}
 </style></head><body>
- <div id="ptr" style="position:fixed;top:0;left:0;right:0;text-align:center;padding:8px;color:#94a3b8;font-size:13px;transform:translateY(-40px);transition:transform .15s;z-index:6">&#8595; pull to refresh</div>
- <div id="toast" class="toast"></div>
- <div id="bottleModal" class="modal"><div class="modalcard">
-   <div style="font-size:16px;font-weight:600;margin-bottom:14px" id="bmTitle">Register new bottle</div>
-   <label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="bmNow" checked onchange="bmToggle()"> Fitted now</label>
-   <div id="bmWhen" style="margin-top:12px;display:none">
-     <div style="font-size:13px;color:#94a3b8;margin-bottom:5px">Date &amp; time fitted (past only):</div>
-     <input type="datetime-local" id="bmTime" style="width:100%;box-sizing:border-box;background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:9px;font-size:14px">
+<div id="toast" class="toast"></div>
+<div id="ptr" style="position:fixed;top:0;left:0;right:0;text-align:center;padding:8px;color:var(--muted);font-size:13px;transform:translateY(-40px);transition:transform .15s;z-index:6">&#8595; pull to refresh</div>
+
+<div id="bottleModal" class="modal"><div class="modalcard">
+  <div style="font-size:16px;font-weight:700;margin-bottom:12px" id="bmTitle">Register new bottle</div>
+  <label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer"><input type="checkbox" id="bmNow" checked onchange="bmToggle()"> Fitted now</label>
+  <div id="bmWhen" style="margin-top:12px;display:none">
+    <div class="mut" style="font-size:13px;margin-bottom:5px">Date &amp; time fitted (past only):</div>
+    <input type="datetime-local" id="bmTime" style="width:100%">
+  </div>
+  <div style="display:flex;gap:10px;margin-top:16px">
+    <button type="button" class="btn s" onclick="closeBottle()">Cancel</button>
+    <button type="button" class="btn p" onclick="confirmBottle()">Confirm</button>
+  </div>
+</div></div>
+<div id="histModal" class="modal"><div class="modalcard" style="width:420px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <div style="font-size:16px;font-weight:700" id="histTitle">Bottle history</div>
+    <button type="button" class="btn s" style="flex:0;padding:5px 11px" onclick="closeHistory()">Close</button>
+  </div>
+  <div id="histBody" style="max-height:60vh;overflow:auto">loading...</div>
+</div></div>
+<div id="labGridModal" class="modal"><div class="modalcard" style="width:420px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <div style="font-size:16px;font-weight:700" id="labGridTitle">Readings</div>
+    <button type="button" class="btn s" style="flex:0;padding:5px 11px" onclick="closeLabGrid()">Close</button>
+  </div>
+  <div id="labGridBody" style="max-height:60vh;overflow:auto">loading...</div>
+</div></div>
+
+<div class="app">
+ <div class="top">
+   <div><h1>Pool Stats <span id="nick" style="font-size:14px;color:var(--muted);font-weight:400"></span></h1>
+     <div class="sub" id="sub">loading...</div></div>
+   <button class="iconbtn" id="themeBtn" onclick="cycleTheme()" title="Theme"></button>
+ </div>
+ <div id="errbox"></div>
+
+ <!-- DASHBOARD -->
+ <div class="page active" id="p-dash"><div class="wrap">
+   <div class="card">
+     <div class="cardhead"><div class="t">
+       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2s6 6.5 6 11a6 6 0 0 1-12 0c0-4.5 6-11 6-11z"/></svg>
+       Water quality</div><span class="mut" style="font-size:12px">tap a metric</span></div>
+     <div class="wq" id="wq"></div>
    </div>
-   <div style="display:flex;gap:10px;margin-top:18px">
-     <button type="button" onclick="closeBottle()" class="ghost" style="flex:1;margin:0">Cancel</button>
-     <button type="button" onclick="confirmBottle()" style="flex:1">Confirm</button>
+   <div class="card" id="detailCard" style="display:none">
+     <div class="cardhead"><div class="t"><span id="dIcon"></span><span id="dTitle"></span></div><span class="mut" id="dAge"></span></div>
+     <div class="detail">
+       <div><div class="big"><span id="dVal">-</span><small id="dUnit"></small></div>
+         <div class="lab" id="dStatus"></div>
+         <div class="mut" id="dRange" style="font-size:12px;margin-top:2px"></div></div>
+       <div class="spark" id="dSpark"></div>
+     </div>
+   </div>
+
+   <div class="sect">Bottles</div>
+   <div class="bottles" id="bottles"></div>
+
+   <div class="sect">Filtration</div>
+   <div class="card">
+     <div class="cardhead"><div class="t"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg><span id="filtState">Filtration</span></div><span class="mut" id="filtToday"></span></div>
+     <div class="mut" style="font-size:12px;margin-bottom:8px">Daily runtime (last 10 days)</div>
+     <div class="chartbox" id="chartFilt"></div>
+     <div style="display:flex;gap:14px;justify-content:flex-end;font-size:11px;color:var(--muted);margin:8px 2px 0">
+       <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--primary);margin-right:4px"></span>off-peak</span>
+       <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--orp);margin-right:4px"></span>peak</span></div>
+     <div class="grow" id="filtSummary"><span class="k">Last 7 days</span><span class="v">-</span></div>
    </div>
  </div></div>
- <div id="histModal" class="modal"><div class="modalcard" style="width:420px">
-   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-     <div style="font-size:16px;font-weight:600" id="histTitle">Bottle history</div>
-     <button type="button" class="ghost" style="padding:4px 10px" onclick="closeHistory()">Close</button>
+
+ <!-- HISTORY -->
+ <div class="page" id="p-hist"><div class="wrap">
+   <div class="card">
+     <div class="cardhead"><div class="t">pH &amp; Redox</div>
+       <div class="seg"><button id="hr1" class="active" onclick="setRange(1)">24h</button><button id="hr7" onclick="setRange(7)">7d</button><button id="hr30" onclick="setRange(30)">30d</button></div></div>
+     <div style="position:relative;height:190px"><canvas id="chartPhOrp"></canvas></div>
    </div>
-   <div id="histBody" style="max-height:60vh;overflow:auto">loading...</div>
+   <div class="card">
+     <div class="cardhead"><div class="t">Product used</div>
+       <div style="display:flex;gap:6px;flex-wrap:wrap"><div class="seg"><button id="uc_cl" class="active" onclick="setUsageChem('cl')">Cl</button><button id="uc_ph" onclick="setUsageChem('ph')">pH</button></div>
+       <div class="seg"><button id="up_day" class="active" onclick="setUsage('day')">Day</button><button id="up_week" onclick="setUsage('week')">Week</button><button id="up_month" onclick="setUsage('month')">Month</button></div></div></div>
+     <canvas id="chartUsage" height="120"></canvas>
+     <div class="mut" id="usageSummary" style="font-size:12.5px;margin-top:8px"></div>
+   </div>
+   <div class="card" id="corrCard">
+     <div class="cardhead"><div class="t">Correlation</div>
+       <div style="display:flex;gap:6px;flex-wrap:wrap"><div class="seg" id="corrParamSeg"></div>
+       <div class="seg"><button id="cp_orp" class="active" onclick="setCorrProbe('orp')">Redox</button><button id="cp_ph" onclick="setCorrProbe('ph')">pH</button><button id="cp_temp" onclick="setCorrProbe('temp')">Temp</button></div></div></div>
+     <div style="position:relative;height:200px"><canvas id="chartCorr"></canvas></div>
+     <div class="mut" id="corrSummary" style="font-size:12.5px;margin-top:8px"></div>
+   </div>
+   <div class="card" id="labListCard">
+     <div class="cardhead"><div class="t">Lab tests</div><span class="mut" id="labWhen" style="font-size:12px"></span></div>
+     <div id="labList"></div>
+     <div class="mut" style="font-size:12px;margin-top:8px">Tap a test to see every reading &rarr;</div>
+   </div>
  </div></div>
- <div class="wrap">
- <a href="/config" title="Settings" style="position:fixed;top:10px;right:58px;z-index:5;font-size:22px;line-height:1;padding:6px 10px;text-decoration:none;color:#fff;background:#334155;border-radius:8px">&#9881;</a>
- <button id="refbtn" class="ghost" title="Refresh" style="position:fixed;top:10px;right:10px;z-index:5;font-size:18px;line-height:1;padding:8px 12px" onclick="refresh()">&#8635;</button>
- <h1 id="title"><img src="/apple-touch-icon.png" alt="">Pool Stats <span id="nick" style="font-size:14px;color:#94a3b8;font-weight:400"></span></h1>
- <div class="status" id="sub">loading...</div>
- <div id="err"></div>
- <div class="sect">Live</div>
- <div class="grid">
-  <div class="card"><div class="lbl">pH</div><div class="val" id="ph">-</div><div class="unit">target 6.6-8.0</div></div>
-  <div class="card"><div class="lbl">ORP / Redox</div><div class="val" id="orp">-</div><div class="unit">mV</div></div>
-  <div class="card"><div class="lbl">Water temp</div><div class="val" id="temp">-</div><div class="unit">&deg;C</div></div>
-  <div class="card"><div class="lbl">Filtration</div><div class="val" id="filt">-</div><div class="unit" id="filtmode"></div></div>
- </div>
- <div class="sect">Treatment today</div>
- <div class="grid">
-  <div class="card"><div class="lbl">Chlorine dosed</div><div class="val" id="today">-</div><div class="unit">mL liquid Cl</div></div>
-  <div class="card"><div class="lbl">pH-minus dosed</div><div class="val" id="phtoday">-</div><div class="unit">mL today</div></div>
-  <div class="card"><div class="lbl">Salt cell today</div><div class="val" id="saltgen">-</div><div class="unit" id="saltml"></div></div>
- </div>
- <div class="sect">Bottles</div>
- <div class="grid2">
-  <div class="panel" style="margin-top:0">
-   <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Chlorine (liquid)</div>
-   <div class="val" style="font-size:26px;font-weight:700"><span id="used">-</span> <span class="unit">L used</span>
-      &nbsp;<span class="unit">/ <span id="rem">-</span> L left of <span id="bottle">-</span> L</span></div>
-   <div class="bar"><div id="barfill" style="width:0%"></div></div>
-   <div class="sub" id="bottleinfo" style="margin-top:10px"></div>
-   <div class="row" style="margin-top:12px">
-     <button type="button" onclick="openBottle('cl')"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6M10 2v3.5L7 9v11a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9l-3-3.5V2"/><path d="M7 13h10"/></svg>Register new</button>
-     <button type="button" class="ghost" onclick="openHistory('cl')">History</button>
+
+ <!-- ALERTS -->
+ <div class="page" id="p-alerts"><div class="wrap"><div id="alertsBody"></div></div></div>
+
+ <!-- SETTINGS -->
+ <div class="page" id="p-set"><div class="wrap">
+   <div class="card">
+     <div class="grow"><span class="k">Open full settings</span><a href="/config" class="v">Settings &rarr;</a></div>
+     <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
+     <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-  </div>
-  <div class="panel" style="margin-top:0">
-   <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">pH-minus (liquid)</div>
-   <div class="val" style="font-size:26px;font-weight:700"><span id="used_ph">-</span> <span class="unit">L used</span>
-      &nbsp;<span class="unit">/ <span id="rem_ph">-</span> L left of <span id="bottle_ph">-</span> L</span></div>
-   <div class="bar"><div id="barfill_ph" style="width:0%"></div></div>
-   <div class="sub" id="bottleinfo_ph" style="margin-top:10px"></div>
-   <div class="row" style="margin-top:12px">
-     <button type="button" onclick="openBottle('ph')"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2h6M10 2v3.5L7 9v11a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9l-3-3.5V2"/><path d="M7 13h10"/></svg>Register new</button>
-     <button type="button" class="ghost" onclick="openHistory('ph')">History</button>
-   </div>
-  </div>
- </div>
- <div id="labSection" style="display:none">
-  <div class="sect">Lab tests (PoolLab) <span id="labwhen" style="text-transform:none;letter-spacing:0;font-weight:400;color:#64748b"></span></div>
-  <div id="labGrid" class="grid"></div>
-  <div class="panel" id="labChartPanel" style="display:none">
-   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
-     <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Lab history</div>
-     <div class="seg" id="labParamSeg"></div>
-   </div>
-   <div style="position:relative;height:200px"><canvas id="labChart"></canvas></div>
-  </div>
- </div>
- <div class="panel">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-    <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">pH &amp; Redox</div>
-    <div class="seg">
-      <button id="segR24" class="active" type="button" onclick="setRange(1)">24h</button>
-      <button id="segR7" type="button" onclick="setRange(7)">7d</button>
-      <button id="segR30" type="button" onclick="setRange(30)">30d</button>
-    </div>
-  </div>
-  <div style="position:relative;height:200px"><canvas id="chart"></canvas></div>
- </div>
- <div class="panel">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
-    <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Product used</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <div class="seg">
-        <button id="uchemcl" class="active" type="button" onclick="setUsageChem('cl')">Chlorine</button>
-        <button id="uchemph" type="button" onclick="setUsageChem('ph')">pH-minus</button>
-      </div>
-      <div class="seg">
-        <button id="segDay" class="active" type="button" onclick="setUsage('day')">Day</button>
-        <button id="segWeek" type="button" onclick="setUsage('week')">Week</button>
-        <button id="segMonth" type="button" onclick="setUsage('month')">Month</button>
-      </div>
-    </div>
-  </div>
-  <canvas id="usageChart" height="120"></canvas>
-  <div class="sub" id="usageSummary" style="margin-top:8px"></div>
- </div>
- <div class="panel">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-    <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Filter runtime &amp; cost</div>
-    <div class="seg">
-      <button id="fsegDay" class="active" type="button" onclick="setFilterPeriod('day')">Day</button>
-      <button id="fsegWeek" type="button" onclick="setFilterPeriod('week')">Week</button>
-      <button id="fsegMonth" type="button" onclick="setFilterPeriod('month')">Month</button>
-    </div>
-  </div>
-  <canvas id="filterChart" height="120"></canvas>
-  <div class="sub" id="filterSummary" style="margin-top:8px"></div>
- </div>
- <div class="panel" id="coverPanel" style="display:none">
-  <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase;margin-bottom:6px">Pool cover</div>
-  <div class="val" id="coverState" style="font-size:22px">-</div>
-  <div class="sub" id="coverInfo" style="margin:4px 0 8px"></div>
-  <img id="coverImg" style="width:100%;border-radius:8px;display:none" alt="">
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.0.0</div>
+ </div></div>
+
+ <div class="tabbar">
+   <button class="tab active" data-p="dash" onclick="go('dash')"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 11.5 12 4l9 7.5"/><path d="M5 10v10h14V10"/></svg>Dashboard</button>
+   <button class="tab" data-p="hist" onclick="go('hist')"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l3-3 3 2 5-6"/></svg>History</button>
+   <button class="tab" data-p="alerts" onclick="go('alerts')"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9z"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>Alerts<span class="badge" id="alertBadge" style="display:none">0</span></button>
+   <button class="tab" data-p="set" onclick="go('set')"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1V21a2 2 0 0 1-4 0v-.1A1.6 1.6 0 0 0 7 19.4a1.6 1.6 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.6 1.6 0 0 0-1.1-2.7H1a2 2 0 0 1 0-4h.1A1.6 1.6 0 0 0 4.6 7a1.6 1.6 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.6 1.6 0 0 0 1.8.3H9a1.6 1.6 0 0 0 1-1.5V1a2 2 0 0 1 4 0v.1a1.6 1.6 0 0 0 1 1.5 1.6 1.6 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0-.3 1.8V7a1.6 1.6 0 0 0 1.5 1H23a2 2 0 0 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>Settings</button>
  </div>
 </div>
+
 <script>
-async function load(){
- const s = await (await fetch('/api/status')).json();
- const r = s.reading || {};
- document.getElementById('nick').textContent = (r.nickname||'');
- document.getElementById('sub').textContent =
-    'Updated ' + relTime(s.last_ok) + '  |  every ' + s.poll_minutes + ' min'
-    + (s.notified_final ? '  |  CHANGE-BOTTLE alert sent' : (s.notified_warn ? '  |  low-chlorine alert sent' : ''));
- document.getElementById('err').innerHTML = s.last_error ? '<div class="err">Last error: '+s.last_error+'</div>' : '';
- const set=(id,v,d)=>document.getElementById(id).textContent=(v==null?'-':(typeof v==='number'?v.toFixed(d):v));
- set('temp', r.temp, 1); set('today', r.today_ml, 0); set('phtoday', r.ph_today_ml, 0);
- setZone('ph', r.ph, r.ph_min, r.ph_max, 2);
- setZone('orp', r.orp, r.orp_min, r.orp_max, 0);
- set('saltgen', r.salt_g, 1);
- document.getElementById('saltml').textContent = (r.salt_ml!=null) ? ('g Cl  ~ '+r.salt_ml.toFixed(0)+' mL liquid') : 'g Cl';
- const f=document.getElementById('filt');
- if(r.filtration==null){f.textContent='-';f.className='val';}
- else{f.textContent=r.filtration? 'ON':'OFF'; f.className='val '+(r.filtration?'on':'off');}
- document.getElementById('filtmode').textContent = modeName(r.filt_mode);
- fillBottle('', r.used_l, s.bottle_l, s.bottle_fitted_at, s.warn_remaining_l, s.final_remaining_l);
- fillBottle('_ph', (r.used_ph!=null? r.used_ph : s.used_ph), s.ph_bottle_l,
-            s.ph_bottle_fitted_at, s.ph_warn_remaining_l, s.ph_final_remaining_l);
- // Pool cover (from the home camera bridge)
- const cp=document.getElementById('coverPanel');
- if(s.cover_ts){
-   cp.style.display='block';
-   const cs=document.getElementById('coverState'), ci=document.getElementById('coverInfo'), cimg=document.getElementById('coverImg');
-   cs.textContent = s.cover_state ? s.cover_state.toUpperCase() : 'image received';
-   cs.className = 'val '+(s.cover_state==='open'?'on':(s.cover_state==='closed'?'off':''));
-   ci.textContent = 'updated '+relTime(s.cover_ts);
-   cimg.src='/api/cover-latest.jpg?t='+Date.now(); cimg.style.display='block';
- } else {
-   cp.style.display='none';   // hidden until the camera bridge is sending images
- }
- lastReading = r;
- drawChart();
- loadUsage();
- filterCfg={pump:(s.pump_kw||0.9), price:(s.price_kwh||0.182), priceOff:(s.price_offpeak||s.price_kwh||0.142), cur:(s.currency||'')};
- loadFilter();
- loadLab();
+var S=null, LAB=null;
+// ---------- theme ----------
+var mode=localStorage.getItem('themeMode')||'auto';
+function eff(){var sys=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';return mode==='auto'?sys:mode;}
+function applyTheme(){document.documentElement.setAttribute('data-theme',eff());
+ var sun='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5 3.5 3.5M20.5 20.5 19 19M19 5l1.5-1.5M3.5 20.5 5 19"/></svg>';
+ var moon='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
+ var auto='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" stroke="none"/></svg>';
+ document.getElementById('themeBtn').innerHTML=mode==='auto'?auto:(eff()==='dark'?moon:sun);}
+function cycleTheme(){mode=mode==='auto'?'light':(mode==='light'?'dark':'auto');localStorage.setItem('themeMode',mode);applyTheme();}
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',applyTheme); applyTheme();
+function go(p){document.querySelectorAll('.page').forEach(function(x){x.classList.remove('active')});
+ document.getElementById('p-'+p).classList.add('active');
+ document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('active',t.dataset.p===p)});window.scrollTo(0,0);}
+
+// ---------- helpers ----------
+function zone(v,lo,hi){if(v==null||lo==null||hi==null)return '';if(v<lo||v>hi)return 'bad';var m=(hi-lo)*0.12;return (v<=lo+m||v>=hi-m)?'warn':'ok';}
+function statusWord(sc){return sc==='bad'?'Out':(sc==='warn'?'Watch':(sc==='ok'?'Ideal':''));}
+function scColor(sc){return sc==='bad'?'var(--bad)':(sc==='warn'?'var(--warn)':'var(--ok)');}
+function fmtDate(iso){var d=new Date((''+iso).length<=10?iso+'T00:00:00':iso);if(isNaN(d))return iso;return d.toLocaleDateString([],{day:'numeric',month:'short'});}
+function friendlyTime(iso){if(!iso)return 'never';var d=new Date(iso);if(isNaN(d))return iso;var now=new Date(),s=(now-d)/1000;var hm=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+ if(s<60)return 'just now';if(s<3600){var m=Math.floor(s/60);return m+' minute'+(m===1?'':'s')+' ago';}
+ if(now.toDateString()===d.toDateString()){var h=Math.floor(s/3600);return h+' hour'+(h===1?'':'s')+' ago';}
+ var y=new Date(now);y.setDate(now.getDate()-1);if(y.toDateString()===d.toDateString())return 'yesterday at '+hm;
+ var days=Math.floor(s/86400);if(days<=7)return days+' days ago at '+hm;
+ var opt={day:'numeric',month:'short'};if(d.getFullYear()!==now.getFullYear())opt.year='numeric';return d.toLocaleDateString([],opt)+' at '+hm;}
+function modeName(m){var n={0:'Manual',1:'Scheduled',2:'Timer',3:'Regulated',4:'Cloned',5:'Special',6:'Test',8:'Pulse'};return m==null?'':(n[m]||('mode '+m));}
+function showToast(msg,ok){var t=document.getElementById('toast');t.textContent=msg;t.className='toast show '+(ok===false?'bad':'ok');clearTimeout(window._tt);window._tt=setTimeout(function(){t.className='toast';},3200);}
+function post(url,body){var opt={method:'POST'};if(body){opt.headers={'Content-Type':'application/x-www-form-urlencoded'};opt.body=body;}return fetch(url,opt).then(function(r){return r.json();}).catch(function(){return {ok:false,message:'Network error'};});}
+
+// ---------- bottle SVG (approved) ----------
+function bottle(pct,c1,c2,topLbl,midLbl){pct=Math.max(0,Math.min(100,pct));
+ var by0=55,by1=305,fillTop=90,off=(by1-(by1-fillTop)*pct/100)-by0;var id='b'+Math.random().toString(36).slice(2,7);
+ return '<svg viewBox="0 0 210 341" width="104" height="169" xmlns="http://www.w3.org/2000/svg">'
+ +'<defs><linearGradient id="liq'+id+'" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="'+c1+'"/><stop offset="1" stop-color="'+c2+'"/></linearGradient>'
+ +'<mask id="m'+id+'"><rect x="87" y="64" width="107" height="232" rx="13" fill="#fff"/></mask>'
+ +'<filter id="s'+id+'" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#46597a" flood-opacity="0.28"/></filter></defs>'
+ +'<rect x="104" y="53" width="28" height="8" rx="4" fill="#f6f9fc" stroke="#ced6e0" stroke-width="2"/>'
+ +'<rect x="98" y="30" width="41" height="26" rx="8" fill="#3c434c"/>'
+ +'<g stroke="#606a76" stroke-width="2" opacity=".8"><line x1="104" y1="35" x2="104" y2="51"/><line x1="109" y1="35" x2="109" y2="51"/><line x1="114" y1="35" x2="114" y2="51"/><line x1="119" y1="35" x2="119" y2="51"/><line x1="124" y1="35" x2="124" y2="51"/><line x1="129" y1="35" x2="129" y2="51"/><line x1="134" y1="35" x2="134" y2="51"/></g>'
+ +'<rect x="78" y="55" width="125" height="250" rx="17" fill="#f6f9fc" filter="url(#s'+id+')"/>'
+ +'<g mask="url(#m'+id+')"><g class="liquid" data-final="'+off.toFixed(1)+'" style="transform:translateY(250px)"><rect x="78" y="55" width="125" height="250" fill="url(#liq'+id+')"/></g></g>'
+ +'<rect x="78" y="55" width="125" height="250" rx="17" fill="none" stroke="#ced6e0" stroke-width="2"/>'
+ +'<g font-family="-apple-system,Segoe UI,Roboto,sans-serif" font-size="15">'
+ +'<g stroke="#96a0ad" stroke-width="2"><line x1="71" y1="98" x2="77" y2="98"/><line x1="71" y1="190" x2="77" y2="190"/><line x1="71" y1="284" x2="77" y2="284"/></g>'
+ +'<g stroke="#b2bac5" stroke-width="2"><line x1="74" y1="144" x2="77" y2="144"/><line x1="74" y1="236" x2="77" y2="236"/></g>'
+ +'<g fill="#828d9b" text-anchor="end"><text x="66" y="103">'+(topLbl||'20 L')+'</text><text x="66" y="195">'+(midLbl||'10 L')+'</text><text x="66" y="289">0 L</text></g></g></svg>';}
+function animateLiquid(){requestAnimationFrame(function(){requestAnimationFrame(function(){
+ document.querySelectorAll('.liquid').forEach(function(el){el.style.transform='translateY('+el.dataset.final+'px)';});});});}
+
+// ---------- load ----------
+function load(){
+ return Promise.all([fetch('/api/status').then(function(r){return r.json();}),
+   fetch('/api/lab-latest').then(function(r){return r.json();}).catch(function(){return {tests:[],configured:false};})])
+ .then(function(res){S=res[0];LAB=res[1];render();}).catch(function(e){document.getElementById('sub').textContent='connection error';});}
+function render(){
+ var r=(S&&S.reading)||{};
+ document.getElementById('nick').textContent=r.nickname||'';
+ document.getElementById('sub').textContent='Updated '+friendlyTime(S.last_ok)+'  |  every '+S.poll_minutes+' min';
+ document.getElementById('errbox').innerHTML=S.last_error?('<div class="wrap"><div class="err">Last error: '+S.last_error+'</div></div>'):'';
+ buildWQ(); buildBottles(); buildFilt(); buildLabList(); buildAlerts();
+ if(curDetail)showDetail(curDetail);
+ animateLiquid();
+ drawPhOrp(); loadUsage(); loadCorr();
 }
-let labParam=null, labChart, labTests=[];
-async function loadLab(){
- let s={};
- try{ s=await (await fetch('/api/lab-latest')).json(); }catch(e){ s={}; }
- const sec=document.getElementById('labSection');
- labTests=s.tests||[];
- if(!s.configured || !labTests.length){ sec.style.display='none'; return; }
- sec.style.display='block';
- document.getElementById('labwhen').textContent = s.last_ok? ('- updated '+relTime(s.last_ok)) : '';
- const grid=document.getElementById('labGrid');
- grid.innerHTML=labTests.map(labTile).join('');
- // parameter buttons for the history chart
- const seg=document.getElementById('labParamSeg');
- if(labParam===null && labTests.length) labParam=labTests[0].key;
- seg.innerHTML=labTests.map(t=>'<button type="button" class="'+(t.key===labParam?'active':'')+'" data-key="'+t.key+'" onclick="setLabParam(this.dataset.key)">'+t.label+'</button>').join('');
- document.getElementById('labChartPanel').style.display = labTests.length? 'block':'none';
- drawLabChart();
-}
-function labTile(t){
- const z=zone(t.value, t.ideal_low, t.ideal_high);
- const val=(t.value==null?'-':(+t.value).toFixed(t.dec));
- const rng=(t.ideal_low!=null&&t.ideal_high!=null)? ('ideal '+t.ideal_low+'-'+t.ideal_high+(t.unit?(' '+t.unit):'')) : (t.unit||'');
- return '<div class="card"><div class="lbl">'+t.label+'</div>'
-   +'<div class="val '+z+'">'+val+'</div>'
-   +'<div class="unit">'+rng+'</div>'
-   +'<div class="sub" style="margin-top:4px;font-size:11px">'+relTime(t.ts)+'</div></div>';
-}
-function setLabParam(k){ labParam=k;
- document.querySelectorAll('#labParamSeg button').forEach(b=>b.classList.toggle('active', b.dataset.key===k));
- drawLabChart();
-}
-async function drawLabChart(){
- if(!labParam) return;
- let h=[];
- try{ h=await (await fetch('/api/lab-history?param='+encodeURIComponent(labParam))).json(); }catch(e){}
- const t=labTests.find(x=>x.key===labParam)||{};
- const fmt=x=>{const d=new Date(x.ts); return isNaN(d)? x.ts : d.toLocaleDateString([], {day:'numeric',month:'short'}); };
- const ds=[{label:t.label||labParam, data:h.map(x=>x.value), borderColor:'#34d399', backgroundColor:'#34d399', borderWidth:2, tension:.25, pointRadius:3}];
- const lo=h.length?h[h.length-1].ideal_low:null, hi=h.length?h[h.length-1].ideal_high:null;
- if(lo!=null) ds.push({label:'ideal low', data:h.map(()=>lo), borderColor:'#64748b', borderDash:[5,4], borderWidth:1, pointRadius:0});
- if(hi!=null) ds.push({label:'ideal high', data:h.map(()=>hi), borderColor:'#64748b', borderDash:[5,4], borderWidth:1, pointRadius:0});
- const data={labels:h.map(fmt), datasets:ds};
- const opts={responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
-   scales:{y:{grid:{color:'#334155'},ticks:{color:'#cbd5e1'}},
-           x:{ticks:{maxTicksLimit:8,color:'#94a3b8'},grid:{display:false}}}};
- if(labChart) labChart.destroy();
- labChart=new Chart(document.getElementById('labChart'),{type:'line',data,options:opts});
-}
-function relTime(iso){
- if(!iso) return 'never';
- const d=new Date(iso); if(isNaN(d)) return iso;
- const now=new Date(), y=new Date(); y.setDate(now.getDate()-1);
- const same=(a,b)=>a.toDateString()===b.toDateString();
- const hm=d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
- if(same(d,now)) return 'today '+hm;
- if(same(d,y)) return 'yesterday '+hm;
- return d.toLocaleDateString([], {weekday:'short',day:'numeric',month:'short'})+' '+hm;
-}
-function zone(v,min,max){
- if(v==null||min==null||max==null) return '';
- if(v<min||v>max) return 'bad';
- const rng=max-min, m=rng*0.12;
- if(v<=min+m||v>=max-m) return 'warn';
- return 'ok';
-}
-function setZone(id,v,min,max,dec){
- const el=document.getElementById(id);
- el.textContent=(v==null?'-':v.toFixed(dec));
- el.className='val '+zone(v,min,max);
-}
-function modeName(m){
- const names={0:'Manual',1:'Scheduled',2:'Timer',3:'Regulated',4:'Cloned',5:'Special',6:'Test',8:'Pulse'};
- return (m==null)?'':(names[m]||('mode '+m));
-}
-function showToast(msg, ok){
- const t=document.getElementById('toast');
- t.textContent=msg; t.className='toast show '+(ok===false?'bad':'ok');
- clearTimeout(window._tt); window._tt=setTimeout(()=>{t.className='toast';},3500);
-}
-async function postAction(url, body){
- const opt={method:'POST'};
- if(body){opt.headers={'Content-Type':'application/x-www-form-urlencoded'}; opt.body=body;}
- try{ const r=await fetch(url,opt); return await r.json(); }
- catch(e){ return {ok:false, message:'Network error'}; }
-}
-function localNowStr(){ const d=new Date(); const p=n=>String(n).padStart(2,'0');
- return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes()); }
-function bmToggle(){ document.getElementById('bmWhen').style.display=document.getElementById('bmNow').checked?'none':'block'; }
-const CHEMNAME={cl:'chlorine', ph:'pH-minus'};
-function fillBottle(sfx, used, size, fitted, warn, final){
- document.getElementById('bottle'+sfx).textContent=(size==null?'-':size);
- if(used!=null){
-   const rem=Math.max(size-used,0);
-   document.getElementById('used'+sfx).textContent=used.toFixed(1);
-   document.getElementById('rem'+sfx).textContent=rem.toFixed(1);
-   document.getElementById('barfill'+sfx).style.width=Math.max(0,100-used/size*100)+'%';
-   document.getElementById('bottleinfo'+sfx).textContent='fitted '+relTime(fitted)+'   |   alerts at '+warn+' L and '+final+' L left';
- } else {
-   document.getElementById('used'+sfx).textContent='no baseline';
-   document.getElementById('rem'+sfx).textContent='-';
-   document.getElementById('barfill'+sfx).style.width='0%';
-   document.getElementById('bottleinfo'+sfx).textContent='Tap "Register new" to start tracking.';
- }
-}
-let bmChem='cl';
-function openBottle(chem){
- bmChem=chem||'cl';
- document.getElementById('bmTitle').textContent='Register new '+CHEMNAME[bmChem]+' bottle';
- document.getElementById('bmNow').checked=true;
- const t=document.getElementById('bmTime'); t.value=localNowStr(); t.max=localNowStr();
- bmToggle();
- document.getElementById('bottleModal').classList.add('show');
-}
-function closeBottle(){ document.getElementById('bottleModal').classList.remove('show'); }
-async function confirmBottle(){
- let body='chem='+bmChem;
- if(!document.getElementById('bmNow').checked){
-   const t=document.getElementById('bmTime').value;
-   if(!t){ showToast('Pick a date and time.', false); return; }
-   const chosen=new Date(t).getTime();
-   if(chosen>Date.now()){ showToast('Date must be in the past.', false); return; }
-   body+='&at_ms='+chosen;
- }
- closeBottle();
- const r=await postAction('/new-bottle', body); showToast(r.message, r.ok); load();
-}
-// ---- Bottle history modal ----
-let histChem='cl';
-function openHistory(chem){
- histChem=chem||'cl';
- const nm=CHEMNAME[histChem];
- document.getElementById('histTitle').textContent=nm.charAt(0).toUpperCase()+nm.slice(1)+' bottle history';
- document.getElementById('histBody').innerHTML='loading...';
- document.getElementById('histModal').classList.add('show');
- renderHistory();
-}
-function closeHistory(){ document.getElementById('histModal').classList.remove('show'); }
-function fmtDur(a,b){
- const start=new Date(a), end=b?new Date(b):new Date();
- if(isNaN(start)) return '';
- const days=Math.max(0,Math.round((end-start)/86400000));
- return days+' day'+(days===1?'':'s');
-}
-async function renderHistory(){
- let rows=[];
- try{ rows=await (await fetch('/api/bottles?chem='+histChem)).json(); }catch(e){}
- const body=document.getElementById('histBody');
- body.innerHTML = rows.length ? rows.map(rowHtml).join('') : '<div class="sub">No bottles recorded yet.</div>';
-}
-function rowHtml(b){
- const dur=fmtDur(b.fitted_at, b.replaced_at);
- const used=(b.litres_used==null?'-':b.litres_used.toFixed(1)+' L');
- const tag=b.current?'<span class="on" style="font-size:11px"> (current)</span>':'';
- const iso=(b.fitted_at||'').replace(/"/g,'');
- return '<div class="histrow" data-id="'+b.id+'" data-iso="'+iso+'" data-size="'+(b.size_l||'')+'" style="border-top:1px solid #334155;padding:10px 0">'
-  +'<div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline">'
-  +'<div><b>'+relTime(b.fitted_at)+'</b>'+tag
-  +'<div class="sub">lasted '+dur+'  |  used '+used+' of '+(b.size_l==null?'-':b.size_l+' L')+'</div></div>'
-  +'<div class="row" style="margin:0">'
-  +'<button type="button" class="ghost" style="padding:5px 9px" onclick="histEdit('+b.id+')">Edit</button>'
-  +'<button type="button" class="ghost" style="padding:5px 9px;background:#7f1d1d" onclick="histDelete('+b.id+')">Delete</button>'
-  +'</div></div></div>';
-}
-function isoToLocalInput(iso){ const d=new Date(iso); if(isNaN(d)) return localNowStr(); const p=n=>String(n).padStart(2,'0');
- return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes()); }
-function histEdit(id){
- const row=document.querySelector('.histrow[data-id="'+id+'"]'); if(!row) return;
- const iso=row.dataset.iso||''; const size=row.dataset.size||'';
- row.innerHTML='<div style="padding:4px 0">'
-  +'<div class="sub" style="margin-bottom:4px">Date &amp; time fitted (past only):</div>'
-  +'<input type="datetime-local" id="he_time_'+id+'" value="'+isoToLocalInput(iso)+'" max="'+localNowStr()+'" style="width:100%;box-sizing:border-box;background:#0f172a;border:1px solid #334155;color:#e2e8f0;border-radius:6px;padding:8px;font-size:14px">'
-  +'<div class="row" style="margin-top:6px"><label style="margin:0">Size</label><input type="number" step="1" id="he_size_'+id+'" value="'+(size||'')+'" style="width:80px"><span class="sub">L</span></div>'
-  +'<div class="row" style="margin-top:10px"><button type="button" onclick="histSave('+id+')">Save</button>'
-  +'<button type="button" class="ghost" onclick="renderHistory()">Cancel</button></div></div>';
-}
-async function histSave(id){
- const t=document.getElementById('he_time_'+id).value;
- const sz=document.getElementById('he_size_'+id).value;
- let body='id='+id;
- if(t){ const ms=new Date(t).getTime(); if(ms>Date.now()){ showToast('Date must be in the past.',false); return;} body+='&at_ms='+ms; }
- if(sz) body+='&size_l='+sz;
- const r=await postAction('/api/bottle-edit', body); showToast(r.message, r.ok); renderHistory(); load();
-}
-async function histDelete(id){
- const r=await postAction('/api/bottle-delete', 'id='+id); showToast(r.message, r.ok); renderHistory(); load();
-}
-let usageChart, usagePeriod='day', usageChem='cl', usageData=[];
-async function loadUsage(){
- try{ usageData = await (await fetch('/api/usage?chem='+usageChem)).json(); }catch(e){ usageData=[]; }
- drawUsage();
-}
-function setUsage(p){
- usagePeriod=p;
- ['Day','Week','Month'].forEach(x=>document.getElementById('seg'+x).classList.toggle('active', x.toLowerCase()===p));
- drawUsage();
-}
-function setUsageChem(c){
- usageChem=c;
- document.getElementById('uchemcl').classList.toggle('active', c==='cl');
- document.getElementById('uchemph').classList.toggle('active', c==='ph');
- loadUsage();
-}
-function bucketUsage(){
- if(usagePeriod==='day') return usageData.slice(-30).map(d=>({label:d.date.slice(5), litres:d.litres}));
- const map={};
- usageData.forEach(d=>{
-   let key;
-   if(usagePeriod==='month'){ key=d.date.slice(0,7); }
-   else { const dt=new Date(d.date+'T00:00:00'); const off=(dt.getDay()+6)%7;
-          const mon=new Date(dt); mon.setDate(dt.getDate()-off); key=mon.toISOString().slice(0,10); }
-   map[key]=(map[key]||0)+d.litres;
- });
- const keys=Object.keys(map).sort();
- const sliced = usagePeriod==='month'? keys.slice(-12) : keys.slice(-16);
- return sliced.map(k=>({label: usagePeriod==='week'? k.slice(5) : k, litres:+map[k].toFixed(2)}));
-}
-function drawUsage(){
- const b=bucketUsage();
- const total=b.reduce((s,x)=>s+x.litres,0);
- const nm=usageChem==='ph'?'pH-minus':'chlorine';
- document.getElementById('usageSummary').textContent = b.length
-   ? (nm+' - total shown: '+total.toFixed(1)+' L   |   latest '+usagePeriod+': '+b[b.length-1].litres.toFixed(2)+' L')
-   : 'No usage data yet - this builds up as the monitor runs (needs 2+ days).';
- const ctx=document.getElementById('usageChart');
- const color=usageChem==='ph'?'#f472b6':'#f59e0b';
- const data={labels:b.map(x=>x.label), datasets:[{label:'L used', data:b.map(x=>x.litres), backgroundColor:color, borderRadius:4}]};
- const opts={responsive:true, plugins:{legend:{display:false}},
-   scales:{y:{beginAtZero:true,title:{display:true,text:'L'},grid:{color:'#334155'}},
-           x:{ticks:{maxTicksLimit:10,color:'#94a3b8'},grid:{display:false}}}};
- if(usageChart) usageChart.destroy();
- usageChart=new Chart(ctx,{type:'bar',data,options:opts});
-}
-let filterChart, filterPeriod='day', filterData=[], filterCfg={pump:0.9,price:0.182,priceOff:0.142,cur:''};
-async function loadFilter(){
- try{ filterData = await (await fetch('/api/filter-usage')).json(); }catch(e){ filterData=[]; }
- drawFilter();
-}
-function setFilterPeriod(p){
- filterPeriod=p;
- ['Day','Week','Month'].forEach(x=>document.getElementById('fseg'+x).classList.toggle('active', x.toLowerCase()===p));
- drawFilter();
-}
-function bucketFilter(){
- if(filterPeriod==='day') return filterData.slice(-30).map(d=>({label:d.date.slice(5), hours:d.hours, peak:d.peak_hours||0, off:d.offpeak_hours||0}));
- const map={};
- filterData.forEach(d=>{
-   let key;
-   if(filterPeriod==='month'){ key=d.date.slice(0,7); }
-   else { const dt=new Date(d.date+'T00:00:00'); const wd=(dt.getDay()+6)%7;
-          const mon=new Date(dt); mon.setDate(dt.getDate()-wd); key=mon.toISOString().slice(0,10); }
-   const m=map[key]||(map[key]={hours:0,peak:0,off:0});
-   m.hours+=d.hours; m.peak+=(d.peak_hours||0); m.off+=(d.offpeak_hours||0);
- });
- const keys=Object.keys(map).sort();
- const sliced = filterPeriod==='month'? keys.slice(-12) : keys.slice(-16);
- return sliced.map(k=>({label: filterPeriod==='week'? k.slice(5) : k, hours:+map[k].hours.toFixed(1), peak:map[k].peak, off:map[k].off}));
-}
-function drawFilter(){
- const b=bucketFilter();
- const totalH=b.reduce((s,x)=>s+x.hours,0);
- const tp=b.reduce((s,x)=>s+x.peak,0), to=b.reduce((s,x)=>s+x.off,0);
- const cost=tp*filterCfg.pump*filterCfg.price + to*filterCfg.pump*filterCfg.priceOff;
- document.getElementById('filterSummary').textContent = b.length
-   ? ('total shown: '+totalH.toFixed(1)+' h  ~ '+filterCfg.cur+cost.toFixed(2)
-      +'   (peak '+tp.toFixed(1)+'h / off-peak '+to.toFixed(1)+'h)')
-   : 'No filter data yet - builds up as the monitor runs (needs 2+ days).';
- const data={labels:b.map(x=>x.label), datasets:[{label:'hours', data:b.map(x=>x.hours), backgroundColor:'#38bdf8', borderRadius:4}]};
- const opts={responsive:true, plugins:{legend:{display:false}},
-   scales:{y:{beginAtZero:true,title:{display:true,text:'h'},grid:{color:'#334155'}},
-           x:{ticks:{maxTicksLimit:10,color:'#94a3b8'},grid:{display:false}}}};
- if(filterChart) filterChart.destroy();
- filterChart=new Chart(document.getElementById('filterChart'),{type:'bar',data,options:opts});
-}
-let chart, chartRange=1, lastReading={};
-function setRange(d){
- chartRange=d;
- [[1,'segR24'],[7,'segR7'],[30,'segR30']].forEach(a=>document.getElementById(a[1]).classList.toggle('active', a[0]===d));
- drawChart();
-}
-async function drawChart(){
- const r=lastReading||{};
- let h=[];
- try{ h=await (await fetch('/api/history?days='+chartRange)).json(); }catch(e){}
- const fmt=x=>{const d=new Date(x.ts); return chartRange<=1
-    ? d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})
-    : (d.getDate()+'/'+(d.getMonth()+1)); };
- const data={labels:h.map(fmt), datasets:[
-   {label:'pH', data:h.map(x=>x.ph), yAxisID:'y1', borderColor:'#38bdf8', borderWidth:2, tension:.3, pointRadius:0},
-   {label:'ORP', data:h.map(x=>x.orp), yAxisID:'y2', borderColor:'#a78bfa', borderWidth:2, tension:.3, pointRadius:0},
- ]};
- const y1={position:'left',title:{display:true,text:'pH',color:'#94a3b8'},grid:{color:'#334155'},ticks:{color:'#cbd5e1',font:{size:12}}};
- const y2={position:'right',title:{display:true,text:'mV',color:'#94a3b8'},grid:{display:false},ticks:{color:'#cbd5e1',font:{size:12}}};
- if(r.ph_min!=null && r.ph_max!=null){ y1.min=+(r.ph_min*0.95).toFixed(2); y1.max=+(r.ph_max*1.05).toFixed(2); }
- if(r.orp_min!=null && r.orp_max!=null){ y2.min=Math.round(r.orp_min*0.95); y2.max=Math.round(r.orp_max*1.05); }
- const opts={responsive:true, maintainAspectRatio:false, interaction:{mode:'index',intersect:false},
-   scales:{y1, y2, x:{ticks:{maxTicksLimit:6,color:'#94a3b8',font:{size:11},maxRotation:0,autoSkip:true},grid:{display:false}}},
-   plugins:{legend:{labels:{color:'#cbd5e1',boxWidth:12,font:{size:13}}}}};
- if(chart) chart.destroy();
- chart=new Chart(document.getElementById('chart'),{type:'line',data,options:opts});
-}
-async function refresh(){
- const ptr=document.getElementById('ptr');
- ptr.textContent='Refreshing...'; ptr.style.transform='translateY(0)';
- try{ await fetch('/poll-now',{method:'POST'}); }catch(e){}
- await load();
- ptr.style.transform='translateY(-40px)';
- setTimeout(()=>{ptr.textContent='\\u2193 pull to refresh';},300);
-}
-// Pull-to-refresh (iOS home-screen apps disable Safari's native one)
-let ptrStartY=null;
-addEventListener('touchstart',e=>{ ptrStartY = (scrollY<=0)? e.touches[0].clientY : null; },{passive:true});
-addEventListener('touchmove',e=>{
- if(ptrStartY==null) return;
- const dy=e.touches[0].clientY-ptrStartY;
- if(dy>0){ document.getElementById('ptr').style.transform='translateY('+Math.min(dy-40,12)+'px)'; }
-},{passive:true});
-addEventListener('touchend',e=>{
- if(ptrStartY==null) return;
- const dy=e.changedTouches[0].clientY-ptrStartY;
- if(dy>70){ refresh(); } else { document.getElementById('ptr').style.transform='translateY(-40px)'; }
- ptrStartY=null;
-},{passive:true});
-load(); setInterval(load, 60000);
-</script></body></html>"""
+
+// ---------- water quality ----------
+function labTest(k){if(!LAB||!LAB.tests)return null;for(var i=0;i<LAB.tests.length;i++)if(LAB.tests[i].key===k)return LAB.tests[i];return null;}
+function metrics(){var r=(S&&S.reading)||{};var fc=labTest('fc');
+ var m={orp:{title:'Redox (ORP)',dot:'ORP',color:'var(--orp)',val:r.orp,unit:'mV',dec:0,lo:(S.orp_range||[])[0],hi:(S.orp_range||[])[1],live:true,src:'orp'},
+   ph:{title:'pH',dot:'pH',color:'var(--ph)',val:r.ph,unit:'',dec:2,lo:(S.ph_range||[])[0],hi:(S.ph_range||[])[1],live:true,src:'ph'},
+   cl:{title:'Free chlorine',dot:'Cl',color:'var(--cl)',val:fc?fc.value:null,unit:fc?(fc.unit||''):'',dec:2,lo:fc?fc.ideal_low:null,hi:fc?fc.ideal_high:null,live:false,ts:fc?fc.ts:null,src:'lab:fc'},
+   temp:{title:'Water temp',dot:'T',color:'var(--temp)',val:r.temp,unit:'C',dec:1,lo:(S.temp_range||[])[0],hi:(S.temp_range||[])[1],live:true,src:'temp'}};
+ return m;}
+var THERMO='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V5a2 2 0 0 0-4 0v9.76a4 4 0 1 0 4 0z"/></svg>';
+function buildWQ(){var m=metrics();var order=['orp','ph','cl','temp'];
+ document.getElementById('wq').innerHTML=order.map(function(k){var x=m[k];var sc=zone(x.val,x.lo,x.hi);
+  var dot='<div class="dot" style="background:'+x.color+'">'+(k==='temp'?THERMO:x.dot)+'</div>';
+  var val=(x.val==null?'-':(+x.val).toFixed(x.dec));
+  var age=x.live?'live':(x.ts?friendlyTime(x.ts):'no test');
+  return '<div class="chip" data-k="'+k+'" onclick="showDetail(this.dataset.k)">'+dot+'<div class="v">'+val+'</div><div class="s '+sc+'">'+(sc?statusWord(sc):'--')+'</div><div class="age">'+age+'</div></div>';
+ }).join('');
+ if(!curDetail)curDetail='orp';}
+var curDetail=null, detailChart=null;
+function showDetail(k){curDetail=k;var m=metrics()[k];if(!m)return;
+ document.querySelectorAll('.chip').forEach(function(c){c.classList.toggle('sel',c.dataset.k===k);});
+ document.getElementById('detailCard').style.display='block';
+ document.getElementById('dIcon').innerHTML=k==='temp'?THERMO:'<span style="display:inline-block;width:13px;height:13px;border-radius:50%;background:'+m.color+'"></span>';
+ document.getElementById('dTitle').textContent=m.title;
+ document.getElementById('dVal').textContent=(m.val==null?'-':(+m.val).toFixed(m.dec));
+ document.getElementById('dUnit').innerHTML=m.unit?(' '+m.unit):'';
+ var sc=zone(m.val,m.lo,m.hi);var ds=document.getElementById('dStatus');ds.textContent=sc?statusWord(sc):'';ds.style.color=scColor(sc);
+ document.getElementById('dRange').textContent=(m.lo!=null&&m.hi!=null)?('target '+(+m.lo)+'-'+(+m.hi)+(m.unit?(' '+m.unit):'')):'';
+ document.getElementById('dAge').textContent=m.live?'live':(m.ts?('measured '+friendlyTime(m.ts)):'');
+ var url=m.src.indexOf('lab:')===0?('/api/lab-history?param='+m.src.slice(4)):('/api/history?days=7');
+ fetch(url).then(function(r){return r.json();}).then(function(h){
+   var series,fmt;
+   if(m.src.indexOf('lab:')===0){series=h.map(function(x){return {t:x.ts,v:x.value};});}
+   else{series=h.map(function(x){return {t:x.ts,v:x[m.src]};}).filter(function(x){return x.v!=null;});}
+   drawSpark('dSpark',series,m.color);
+ }).catch(function(){drawSpark('dSpark',[],m.color);});}
+function drawSpark(id,series,color){var el=document.getElementById(id);var vals=series.map(function(x){return x.v;});
+ if(!vals.length){el.innerHTML='<div class="mut" style="font-size:12px;padding-top:20px">no history yet</div>';return;}
+ var w=220,h=60,max=Math.max.apply(null,vals),min=Math.min.apply(null,vals),rng=(max-min)||1;
+ var pts=vals.map(function(v,i){return [8+i*(w-16)/Math.max(vals.length-1,1),h-8-((v-min)/rng)*(h-18)];});
+ var d=pts.map(function(p,i){return (i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1);}).join(' ');
+ var area=d+' L '+pts[pts.length-1][0].toFixed(1)+' '+h+' L 8 '+h+' Z';
+ el.innerHTML='<svg width="100%" height="'+h+'" viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><path d="'+area+'" fill="'+color+'" opacity=".14"/><path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';}
+
+// ---------- bottles ----------
+var CHEM={cl:{name:'Chlorine',c1:'#63aef5',c2:'#3778d4'},ph:{name:'pH-minus',c1:'#f7c65e',c2:'#e79328'}};
+function bottleCard(chem,fc,warn,fin){var meta=CHEM[chem];var has=fc&&fc.remaining!=null;
+ var pct=has?Math.round(fc.pct):0;var pillcls=pct<=15?'bad':(pct<=35?'warn':'ok');
+ var svg='<div>'+bottle(pct,meta.c1,meta.c2,(fc&&fc.size?fc.size:20)+' L',((fc&&fc.size?fc.size:20)/2)+' L')+'</div>';
+ var days=(has&&fc.days_left!=null)?('<div class="row2" style="color:var(--ok)">&asymp; '+Math.round(fc.days_left)+' days left</div><div class="mut" style="font-size:12px">Est. empty: '+(fc.est_empty?fmtDate(fc.est_empty):'-')+'</div>')
+   :'<div class="row2" style="color:var(--primary)">Estimate unavailable</div><div class="mut" style="font-size:12px">'+(has?'building forecast':'no baseline yet')+'</div>';
+ var ut=(has&&fc.used_today!=null)?(fc.used_today<0.1?((fc.used_today*1000).toFixed(0)+' mL'):(fc.used_today.toFixed(2)+' L')):'-';
+ var av=(has&&fc.avg_per_day!=null)?(fc.avg_per_day.toFixed(2)+' L/day'):'-';
+ var rem=has?fc.remaining.toFixed(1):'--';
+ return '<div class="card"><div class="bottle">'+svg+'<div class="info">'
+  +'<div class="bhead"><span class="bname">'+meta.name+'</span><span class="pct '+pillcls+'">'+(has?pct+'%':'-')+'</span></div>'
+  +'<div class="rem">'+rem+' <small>L remaining</small></div>'+days
+  +'<div class="divider"></div><div class="statcols">'
+  +'<div class="stat"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3s6 6.5 6 11a6 6 0 0 1-12 0c0-4.5 6-11 6-11z"/></svg><div><b>'+ut+'</b><span>used today</span></div></div>'
+  +'<div class="stat"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 14l3-3 3 2 5-6"/></svg><div><b>'+av+'</b><span>avg use</span></div></div></div>'
+  +'<div class="btns"><button class="btn p" data-chem="'+chem+'" onclick="openBottle(this.dataset.chem)">Register new</button><button class="btn s" data-chem="'+chem+'" onclick="openHistory(this.dataset.chem)">History</button></div>'
+  +'</div></div></div>';}
+function buildBottles(){document.getElementById('bottles').innerHTML=
+  bottleCard('cl',S.cl_forecast,S.warn_remaining_l,S.final_remaining_l)+
+  bottleCard('ph',S.ph_forecast,S.ph_warn_remaining_l,S.ph_final_remaining_l);}
+
+// ---------- filtration ----------
+var filtData=[];
+function buildFilt(){var r=S.reading||{};
+ document.getElementById('filtState').textContent=r.filtration==null?'Filtration':(r.filtration?('Running '+(r.filt_mode!=null?('- '+modeName(r.filt_mode)):'')):'Off');
+ fetch('/api/filter-usage').then(function(x){return x.json();}).then(function(d){filtData=d||[];drawFilt();}).catch(function(){filtData=[];drawFilt();});}
+function drawFilt(){var box=document.getElementById('chartFilt');var days=filtData.slice(-10);
+ if(!days.length){box.innerHTML='<div class="mut" style="font-size:12px">builds up as it runs</div>';document.getElementById('filtSummary').innerHTML='<span class="k">Last 7 days</span><span class="v">-</span>';return;}
+ var maxH=Math.max.apply(null,days.map(function(d){return d.hours||0;}))||1;
+ box.innerHTML=days.map(function(d){var pk=(d.peak_hours||0)/maxH*100,of=(d.offpeak_hours||0)/maxH*100;
+  return '<div style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%"><div style="height:'+pk+'%;background:var(--orp);border-radius:5px 5px 0 0"></div><div style="height:'+of+'%;background:var(--primary);border-radius:0 0 3px 3px"></div></div>';}).join('');
+ var last7=filtData.slice(-7);var pk=last7.reduce(function(s,d){return s+(d.peak_hours||0);},0),of=last7.reduce(function(s,d){return s+(d.offpeak_hours||0);},0);
+ var kw=S.pump_kw||0.9;var cost=pk*kw*(S.price_kwh||0.182)+of*kw*(S.price_offpeak||0.142);
+ document.getElementById('filtSummary').innerHTML='<span class="k">Last 7 days</span><span class="v">'+(pk+of).toFixed(1)+' h &middot; '+(S.currency||'')+cost.toFixed(2)+'</span>';
+ document.getElementById('filtToday').textContent='';}
+
+// ---------- bottle modals ----------
+var bmChem='cl';
+function bmToggle(){document.getElementById('bmWhen').style.display=document.getElementById('bmNow').checked?'none':'block';}
+function localNowStr(){var d=new Date();function p(n){return String(n).padStart(2,'0');}return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes());}
+function openBottle(chem){bmChem=chem;document.getElementById('bmTitle').textContent='Register new '+CHEM[chem].name+' bottle';document.getElementById('bmNow').checked=true;var t=document.getElementById('bmTime');t.value=localNowStr();t.max=localNowStr();bmToggle();document.getElementById('bottleModal').classList.add('show');}
+function closeBottle(){document.getElementById('bottleModal').classList.remove('show');}
+function confirmBottle(){var body='chem='+bmChem;if(!document.getElementById('bmNow').checked){var t=document.getElementById('bmTime').value;if(!t){showToast('Pick a date and time.',false);return;}var c=new Date(t).getTime();if(c>Date.now()){showToast('Date must be in the past.',false);return;}body+='&at_ms='+c;}closeBottle();post('/new-bottle',body).then(function(r){showToast(r.message,r.ok);load();});}
+var histChem='cl';
+function openHistory(chem){histChem=chem;var nm=CHEM[chem].name;document.getElementById('histTitle').textContent=nm+' bottle history';document.getElementById('histBody').innerHTML='loading...';document.getElementById('histModal').classList.add('show');renderHistory();}
+function closeHistory(){document.getElementById('histModal').classList.remove('show');}
+function fmtDur(a,b){var s=new Date(a),e=b?new Date(b):new Date();if(isNaN(s))return '';var days=Math.max(0,Math.round((e-s)/86400000));return days+' day'+(days===1?'':'s');}
+function renderHistory(){fetch('/api/bottles?chem='+histChem).then(function(r){return r.json();}).then(function(rows){var b=document.getElementById('histBody');b.innerHTML=rows.length?rows.map(rowHtml).join(''):'<div class="mut">No bottles recorded yet.</div>';}).catch(function(){});}
+function rowHtml(b){var dur=fmtDur(b.fitted_at,b.replaced_at);var used=(b.litres_used==null?'-':b.litres_used.toFixed(1)+' L');var tag=b.current?'<span style="color:var(--ok);font-size:11px"> (current)</span>':'';var iso=(b.fitted_at||'').replace(/"/g,'');
+ return '<div class="histrow" data-id="'+b.id+'" data-iso="'+iso+'" data-size="'+(b.size_l||'')+'" style="border-top:1px solid var(--line);padding:10px 0"><div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline"><div><b>'+friendlyTime(b.fitted_at)+'</b>'+tag+'<div class="mut" style="font-size:12px">lasted '+dur+'  |  used '+used+' of '+(b.size_l==null?'-':b.size_l+' L')+'</div></div><div style="display:flex;gap:8px"><button class="btn s" style="flex:0;padding:5px 9px" onclick="histEdit('+b.id+')">Edit</button><button class="btn s" style="flex:0;padding:5px 9px;color:var(--bad)" onclick="histDelete('+b.id+')">Delete</button></div></div></div>';}
+function isoToLocal(iso){var d=new Date(iso);if(isNaN(d))return localNowStr();function p(n){return String(n).padStart(2,'0');}return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes());}
+function histEdit(id){var row=document.querySelector('.histrow[data-id="'+id+'"]');if(!row)return;var iso=row.dataset.iso||'',size=row.dataset.size||'';
+ row.innerHTML='<div style="padding:4px 0"><div class="mut" style="font-size:12px;margin-bottom:4px">Date &amp; time fitted (past only):</div><input type="datetime-local" id="he_t_'+id+'" value="'+isoToLocal(iso)+'" max="'+localNowStr()+'" style="width:100%"><div style="display:flex;gap:8px;align-items:center;margin-top:6px"><span class="mut">Size</span><input type="number" step="1" id="he_s_'+id+'" value="'+size+'" style="width:80px"><span class="mut">L</span></div><div style="display:flex;gap:8px;margin-top:10px"><button class="btn p" onclick="histSave('+id+')">Save</button><button class="btn s" onclick="renderHistory()">Cancel</button></div></div>';}
+function histSave(id){var t=document.getElementById('he_t_'+id).value,sz=document.getElementById('he_s_'+id).value;var body='id='+id;if(t){var ms=new Date(t).getTime();if(ms>Date.now()){showToast('Date must be in the past.',false);return;}body+='&at_ms='+ms;}if(sz)body+='&size_l='+sz;post('/api/bottle-edit',body).then(function(r){showToast(r.message,r.ok);renderHistory();load();});}
+function histDelete(id){post('/api/bottle-delete','id='+id).then(function(r){showToast(r.message,r.ok);renderHistory();load();});}
+
+// ---------- lab list + grid ----------
+function buildLabList(){var c=document.getElementById('labListCard');if(!LAB||!LAB.configured||!LAB.tests||!LAB.tests.length){c.style.display='none';return;}c.style.display='block';
+ document.getElementById('labWhen').textContent=(LAB.last_ok?('updated '+friendlyTime(LAB.last_ok)):'')+(LAB.due_count?('  |  '+LAB.due_count+' due'):'');
+ document.getElementById('labList').innerHTML=LAB.tests.map(function(t){var sc=zone(t.value,t.ideal_low,t.ideal_high);var due=t.overdue?(' <span class="pill2">'+overdueTxt(t)+'</span>'):'';
+  return '<div class="grow" data-k="'+t.key+'" onclick="openLabGrid(this.dataset.k)" style="cursor:pointer"><span class="k">'+t.label+due+'</span><span class="v" style="color:'+(sc?scColor(sc):'inherit')+'">'+(t.value==null?'-':(+t.value).toFixed(t.dec))+' <small class="mut">'+friendlyTime(t.ts)+'</small></span></div>';}).join('');}
+function overdueTxt(t){if(t.days_since==null||t.cadence==null)return 'due';var d=Math.round(t.days_since-t.cadence);return d>0?(d+' day'+(d===1?'':'s')+' over'):'due';}
+function openLabGrid(k){var t=labTest(k)||{};document.getElementById('labGridTitle').textContent=(t.label||k)+' - all readings';document.getElementById('labGridBody').innerHTML='loading...';document.getElementById('labGridModal').classList.add('show');
+ fetch('/api/lab-history?param='+encodeURIComponent(k)).then(function(r){return r.json();}).then(function(rows){rows=(rows||[]).slice().reverse();var b=document.getElementById('labGridBody');if(!rows.length){b.innerHTML='<div class="mut">No readings.</div>';return;}var dec=t.dec==null?2:t.dec,unit=t.unit||'';
+  b.innerHTML=rows.map(function(x){return '<div style="display:flex;justify-content:space-between;gap:10px;border-top:1px solid var(--line);padding:8px 0"><span class="mut">'+friendlyTime(x.ts)+'</span><b>'+(x.value==null?'-':(+x.value).toFixed(dec))+' '+unit+'</b></div>';}).join('');}).catch(function(){});}
+function closeLabGrid(){document.getElementById('labGridModal').classList.remove('show');}
+
+// ---------- history charts ----------
+var phOrpChart=null,chartRange=1;
+function setRange(d){chartRange=d;[[1,'hr1'],[7,'hr7'],[30,'hr30']].forEach(function(a){document.getElementById(a[1]).classList.toggle('active',a[0]===d);});drawPhOrp();}
+function drawPhOrp(){var r=(S&&S.reading)||{};fetch('/api/history?days='+chartRange).then(function(x){return x.json();}).then(function(h){
+  var fmt=function(x){var d=new Date(x.ts);return chartRange<=1?d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):(d.getDate()+'/'+(d.getMonth()+1));};
+  var data={labels:h.map(fmt),datasets:[{label:'pH',data:h.map(function(x){return x.ph;}),yAxisID:'y1',borderColor:'#38bdf8',borderWidth:2,tension:.3,pointRadius:0},{label:'ORP',data:h.map(function(x){return x.orp;}),yAxisID:'y2',borderColor:'#a78bfa',borderWidth:2,tension:.3,pointRadius:0}]};
+  var gc=getComputedStyle(document.documentElement).getPropertyValue('--line');var tc=getComputedStyle(document.documentElement).getPropertyValue('--muted');
+  var y1={position:'left',title:{display:true,text:'pH',color:tc},grid:{color:gc},ticks:{color:tc}};var y2={position:'right',title:{display:true,text:'mV',color:tc},grid:{display:false},ticks:{color:tc}};
+  var pr=S.ph_range||[],orr=S.orp_range||[];if(pr[0]!=null){y1.min=+(pr[0]*0.95).toFixed(2);y1.max=+(pr[1]*1.05).toFixed(2);}if(orr[0]!=null){y2.min=Math.round(orr[0]*0.9);y2.max=Math.round(orr[1]*1.1);}
+  var opts={responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},scales:{y1:y1,y2:y2,x:{ticks:{maxTicksLimit:6,color:tc,maxRotation:0,autoSkip:true},grid:{display:false}}},plugins:{legend:{labels:{color:tc,boxWidth:12}}}};
+  if(phOrpChart)phOrpChart.destroy();phOrpChart=new Chart(document.getElementById('chartPhOrp'),{type:'line',data:data,options:opts});}).catch(function(){});}
+var usageChart=null,usagePeriod='day',usageChem='cl',usageData=[];
+function setUsageChem(c){usageChem=c;document.getElementById('uc_cl').classList.toggle('active',c==='cl');document.getElementById('uc_ph').classList.toggle('active',c==='ph');loadUsage();}
+function setUsage(p){usagePeriod=p;['day','week','month'].forEach(function(x){document.getElementById('up_'+x).classList.toggle('active',x===p);});drawUsage();}
+function loadUsage(){fetch('/api/usage?chem='+usageChem).then(function(r){return r.json();}).then(function(d){usageData=d||[];drawUsage();}).catch(function(){usageData=[];drawUsage();});}
+function bucketUsage(){if(usagePeriod==='day')return usageData.slice(-30).map(function(d){return {label:d.date.slice(5),litres:d.litres};});var map={};usageData.forEach(function(d){var key;if(usagePeriod==='month')key=d.date.slice(0,7);else{var dt=new Date(d.date+'T00:00:00');var off=(dt.getDay()+6)%7;var mon=new Date(dt);mon.setDate(dt.getDate()-off);key=mon.toISOString().slice(0,10);}map[key]=(map[key]||0)+d.litres;});var keys=Object.keys(map).sort();var sl=usagePeriod==='month'?keys.slice(-12):keys.slice(-16);return sl.map(function(k){return {label:usagePeriod==='week'?k.slice(5):k,litres:+map[k].toFixed(2)};});}
+function drawUsage(){var b=bucketUsage();var tc=getComputedStyle(document.documentElement).getPropertyValue('--muted');var gc=getComputedStyle(document.documentElement).getPropertyValue('--line');
+ var total=b.reduce(function(s,x){return s+x.litres;},0);var nm=usageChem==='ph'?'pH-minus':'chlorine';
+ document.getElementById('usageSummary').textContent=b.length?(nm+' - total shown '+total.toFixed(1)+' L | latest '+usagePeriod+' '+(b[b.length-1].litres.toFixed(2))+' L'):'builds up as it runs (needs 2+ days)';
+ var color=usageChem==='ph'?'#e79328':'#f59e0b';
+ var data={labels:b.map(function(x){return x.label;}),datasets:[{data:b.map(function(x){return x.litres;}),backgroundColor:color,borderRadius:4}]};
+ var opts={responsive:true,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,grid:{color:gc},ticks:{color:tc}},x:{ticks:{maxTicksLimit:10,color:tc},grid:{display:false}}}};
+ if(usageChart)usageChart.destroy();usageChart=new Chart(document.getElementById('chartUsage'),{type:'bar',data:data,options:opts});}
+var corrChart=null,corrParam='fc',corrProbe='orp';
+var PROBEL={orp:'Redox (mV)',ph:'pH',temp:'Temp (C)'};
+function corrStrength(r){var a=Math.abs(r);return a>=0.7?'strong':a>=0.4?'moderate':a>=0.2?'weak':'little';}
+function buildCorrSeg(){var keys=(LAB&&LAB.tests?LAB.tests.filter(function(t){return ['fc','tc','cc','cya'].indexOf(t.key)>=0;}):[]);if(!keys.length){document.getElementById('corrCard').style.display='none';return;}document.getElementById('corrCard').style.display='block';
+ if(keys.map(function(t){return t.key;}).indexOf(corrParam)<0)corrParam=keys[0].key;
+ document.getElementById('corrParamSeg').innerHTML=keys.map(function(t){return '<button data-k="'+t.key+'" class="'+(t.key===corrParam?'active':'')+'" onclick="setCorrParam(this.dataset.k)">'+t.label.split(' ')[0]+'</button>';}).join('');}
+function setCorrParam(k){corrParam=k;buildCorrSeg();drawCorr();}
+function setCorrProbe(p){corrProbe=p;['orp','ph','temp'].forEach(function(x){document.getElementById('cp_'+x).classList.toggle('active',x===p);});drawCorr();}
+function loadCorr(){buildCorrSeg();drawCorr();}
+function drawCorr(){if(document.getElementById('corrCard').style.display==='none')return;fetch('/api/lab-correlation?param='+corrParam+'&probe='+corrProbe).then(function(r){return r.json();}).then(function(d){
+ var tc=getComputedStyle(document.documentElement).getPropertyValue('--muted');var gc=getComputedStyle(document.documentElement).getPropertyValue('--line');
+ var lt=(labTest(corrParam)||{}).label||corrParam.toUpperCase();var pts=(d.points||[]).map(function(p){return {x:p.x,y:p.y};});
+ var rtxt=(d.r==null)?'not enough paired data yet':('r = '+d.r.toFixed(2)+' (n='+d.n+', '+corrStrength(d.r)+')');
+ document.getElementById('corrSummary').textContent=lt+' vs '+PROBEL[corrProbe]+' - '+rtxt;
+ var data={datasets:[{data:pts,backgroundColor:'#38bdf8',pointRadius:4}]};
+ var opts={responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{title:{display:true,text:lt,color:tc},grid:{color:gc},ticks:{color:tc}},y:{title:{display:true,text:PROBEL[corrProbe],color:tc},grid:{color:gc},ticks:{color:tc}}}};
+ if(corrChart)corrChart.destroy();corrChart=new Chart(document.getElementById('chartCorr'),{type:'scatter',data:data,options:opts});}).catch(function(){});}
+
+// ---------- alerts ----------
+function buildAlerts(){var al=[];var r=(S&&S.reading)||{};
+ if(S.last_error)al.push({sev:'bad',cat:'a',t:'Controller error',d:S.last_error});
+ // lab out of range
+ if(LAB&&LAB.tests)LAB.tests.forEach(function(t){var sc=zone(t.value,t.ideal_low,t.ideal_high);if(sc==='bad'){var lowhi=(t.value<t.ideal_low)?'low':'high';al.push({sev:t.key==='cc'?'bad':'warn',cat:'a',t:t.label+' '+lowhi,d:(t.value==null?'':(+t.value).toFixed(t.dec))+(t.unit?(' '+t.unit):'')+' (target '+(+t.ideal_low)+'-'+(+t.ideal_high)+')'});}});
+ // low bottles
+ [['cl',S.cl_forecast,S.warn_remaining_l,'Chlorine'],['ph',S.ph_forecast,S.ph_warn_remaining_l,'pH-minus']].forEach(function(x){var fc=x[1];if(fc&&fc.remaining!=null&&fc.remaining<=(x[2]||5)){al.push({sev:'warn',cat:'r',t:x[3]+' getting low',d:fc.remaining.toFixed(1)+' L left'+(fc.days_left!=null?(' (~'+Math.round(fc.days_left)+' days)'):'')});}});
+ // overdue tests
+ if(LAB&&LAB.tests)LAB.tests.forEach(function(t){if(t.overdue)al.push({sev:'info',cat:'r',t:t.label+' test overdue',d:'last '+friendlyTime(t.ts)+' - '+overdueTxt(t)});});
+ var badge=document.getElementById('alertBadge');if(al.length){badge.style.display='flex';badge.textContent=al.length;}else badge.style.display='none';
+ var need=al.filter(function(a){return a.cat==='a';}),rem=al.filter(function(a){return a.cat==='r';});
+ function ic(sev){var w='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>';var i='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';return sev==='info'?i:w;}
+ function row(a){return '<div class="alert"><div class="ai '+a.sev+'">'+ic(a.sev)+'</div><div><div class="at">'+a.t+'</div><div class="ad">'+a.d+'</div></div></div>';}
+ var html='';
+ if(need.length)html+='<div class="sect">Needs attention</div>'+need.map(row).join('');
+ if(rem.length)html+='<div class="sect">Reminders</div>'+rem.map(row).join('');
+ if(!al.length)html='<div class="card" style="text-align:center;color:var(--muted)">All good - nothing needs attention.</div>';
+ document.getElementById('alertsBody').innerHTML=html;}
+
+// ---------- misc ----------
+function labSync(){showToast('Syncing PoolLab...');post('/lab-refresh').then(function(r){showToast(r.message,r.ok);load();});}
+function refresh(){var ptr=document.getElementById('ptr');ptr.textContent='Refreshing...';ptr.style.transform='translateY(0)';
+ fetch('/poll-now',{method:'POST'}).catch(function(){}).then(function(){return load();}).then(function(){ptr.style.transform='translateY(-40px)';setTimeout(function(){ptr.textContent='\u2193 pull to refresh';},300);});}
+var ptrStart=null;
+addEventListener('touchstart',function(e){ptrStart=(scrollY<=0)?e.touches[0].clientY:null;},{passive:true});
+addEventListener('touchmove',function(e){if(ptrStart==null)return;var dy=e.touches[0].clientY-ptrStart;if(dy>0)document.getElementById('ptr').style.transform='translateY('+Math.min(dy-40,12)+'px)';},{passive:true});
+addEventListener('touchend',function(e){if(ptrStart==null)return;var dy=e.changedTouches[0].clientY-ptrStart;if(dy>70)refresh();else document.getElementById('ptr').style.transform='translateY(-40px)';ptrStart=null;},{passive:true});
+load();setInterval(load,60000);
+</script></body></html>
+"""
 
 
 def login_html(error=""):
@@ -1399,6 +1412,38 @@ def config_html():
     offwin = _h.escape(str(kv_get("offpeak_window", "22:00-06:00")), quote=True)
     curr   = _h.escape(str(kv_get("currency", "EUR")), quote=True)
     port   = val("SMTP_PORT") or "587"
+    latest_cya = _latest_lab_value("cya")
+    cya_js = "null" if latest_cya is None else repr(round(float(latest_cya), 1))
+    avgdays = kv_get("bottle_avg_days", 14)
+    _labrows, _cadrows = [], []
+    for _k, _lbl in LAB_TARGET_FIELDS:
+        _lo, _hi = _lab_range(_k, None, None)
+        _lo = "" if _lo is None else (f"{_lo:g}")
+        _hi = "" if _hi is None else (f"{_hi:g}")
+        _labrows.append(
+            f'<div class="setrow"><label>{_lbl}</label><span>'
+            f'<input id="lab_lo_{_k}" type="number" step="0.1" value="{_lo}" style="width:64px">'
+            f'<span class="u">to</span>'
+            f'<input id="lab_hi_{_k}" type="number" step="0.1" value="{_hi}" style="width:64px"></span></div>')
+        _cad = _lab_cadence(_k)
+        _cad = "" if _cad is None else (f"{_cad:g}")
+        _cadrows.append(
+            f'<div class="setrow"><label>{_lbl}</label><span>'
+            f'<input id="lab_cad_{_k}" type="number" step="1" min="1" value="{_cad}" style="width:70px">'
+            f'<span class="u">days</span></span></div>')
+    labrows = "\n".join(_labrows)
+    cadrows = "\n".join(_cadrows)
+    _liverows = []
+    for _k, _lbl in (("ph", "pH"), ("orp", "ORP / Redox"), ("temp", "Water temp")):
+        _lo, _hi = _live_range(_k)
+        _lo = "" if _lo is None else (f"{_lo:g}")
+        _hi = "" if _hi is None else (f"{_hi:g}")
+        _liverows.append(
+            f'<div class="setrow"><label>{_lbl}</label><span>'
+            f'<input id="live_lo_{_k}" type="number" step="0.1" value="{_lo}" style="width:64px">'
+            f'<span class="u">to</span>'
+            f'<input id="live_hi_{_k}" type="number" step="0.1" value="{_hi}" style="width:64px"></span></div>')
+    liverows = "\n".join(_liverows)
     head = ("""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
@@ -1434,7 +1479,8 @@ a{color:#93c5fd}
  <div class="setrow"><label>Final alert at</label><span><input id="final" type="number" step="0.1" value="{final}"><span class="u">L left</span></span></div>
  <div class="setrow"><label>Check every</label><span><input id="poll" type="number" step="1" min="1" value="{poll}"><span class="u">min</span></span></div>
  <div class="setrow"><label>Liquid Cl strength</label><span><input id="gpl" type="number" step="1" value="{gpl}"><span class="u">g/L</span></span></div>
- <div class="hint">Used to show the salt cell's output as a liquid-chlorine mL equivalent.</div>
+ <div class="setrow"><label>Forecast avg window</label><span><input id="bottle_avg_days" type="number" step="1" min="1" value="{avgdays}"><span class="u">days</span></span></div>
+ <div class="hint">Salt strength converts the cell output to a liquid-Cl mL equivalent. Forecast window = days of history used to predict how long each bottle lasts.</div>
 </div>
 <div class="panel"><div class="lbl2">pH-minus bottle</div>
  <div class="setrow"><label>Bottle size</label><span><input id="ph_bottle_l" type="number" step="1" value="{ph_bottle}"><span class="u">L</span></span></div>
@@ -1442,6 +1488,10 @@ a{color:#93c5fd}
  <div class="setrow"><label>Final alert at</label><span><input id="ph_final" type="number" step="0.1" value="{ph_final}"><span class="u">L left</span></span></div>
  <div class="setrow"><label>pH pump flow</label><span><input id="ph_pump_lph" type="number" step="0.1" value="{ph_pump}"><span class="u">L/h</span></span></div>
  <div class="hint">pH usage = pump run-time x this flow rate. Calibrate it so "pH dosed today" matches the Klereo app, then usage &amp; alerts stay accurate.</div>
+</div>
+<div class="panel"><div class="lbl2">Live reading targets (pH / ORP / temp)</div>
+{liverows}
+ <div class="hint">Colour bands for the live dashboard tiles. Leave to use sensible defaults; overrides the Klereo regulation limits.</div>
 </div>
 <div class="panel"><div class="lbl2">Filtration cost</div>
  <div class="setrow"><label>Pump power</label><span><input id="pump" type="number" step="0.1" value="{pump}"><span class="u">kW</span></span></div>
@@ -1475,6 +1525,19 @@ a{color:#93c5fd}
    <a href="/api/lab-raw" target="_blank" style="align-self:center">View raw lab data</a>
  </div>
 </div>
+<div class="panel"><div class="lbl2">Lab test targets (colour bands)</div>
+{labrows}
+ <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;align-items:center">
+   <button class="ghost" type="button" onclick="suggestFC()">Suggest FC from CYA</button>
+   <span class="hint" id="cyaHint" style="margin:0"></span>
+ </div>
+ <div class="hint">Used to colour the lab tiles and draw the target lines on charts. These override any range set in LabCom. Free-chlorine suggestion uses the FC/CYA ratio (min 7.5%, up to ~15% of CYA).</div>
+</div>
+<div class="panel"><div class="lbl2">Lab test reminders (retest cadence)</div>
+{cadrows}
+ <div class="hint">How often each test should be re-run. The dashboard flags a metric when it's overdue.</div>
+</div>
+<script>window.LATEST_CYA={cya_js};</script>
 <div class="panel"><div class="lbl2">Filtration control (test)</div>
  <div class="hint" style="margin-top:0">Drive the pump directly. Start/Stop force it into manual; Regulated hands control back to Klereo. Each takes a few seconds.</div>
  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
@@ -1505,11 +1568,22 @@ async function postAction(url, body){
 }
 async function testEmail(){ showToast('Sending test email...'); const r=await postAction('/test-email'); showToast(r.message, r.ok); }
 async function labSync(){ showToast('Syncing PoolLab...'); const r=await postAction('/lab-refresh'); showToast(r.message, r.ok); }
+function suggestFC(){
+ const cya=window.LATEST_CYA;
+ if(cya==null){ showToast('No CYA reading yet - sync PoolLab first.', false); return; }
+ const lo=Math.round(cya*0.075*10)/10, hi=Math.round(cya*0.15*10)/10;
+ document.getElementById('lab_lo_fc').value=lo;
+ document.getElementById('lab_hi_fc').value=hi;
+ showToast('FC target set to '+lo+'-'+hi+' from CYA '+cya+' (not yet saved)', true);
+}
+(function(){ const h=document.getElementById('cyaHint');
+ if(h) h.textContent = (window.LATEST_CYA==null)? 'no CYA reading yet' : ('latest CYA: '+window.LATEST_CYA); })();
 async function filterCtl(a){ showToast('Sending filtration command...'); const r=await postAction('/api/filter-control','action='+a); showToast(r.message, r.ok); }
 async function saveConfig(){
- const ids=['bottle_l','warn','final','ph_bottle_l','ph_warn','ph_final','ph_pump_lph','labcom_poll_hours','poll','gpl','pump','price','price_off','offwin','currency','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS','LABCOM_TOKEN'];
+ const ids=['bottle_l','warn','final','bottle_avg_days','ph_bottle_l','ph_warn','ph_final','ph_pump_lph','labcom_poll_hours','poll','gpl','pump','price','price_off','offwin','currency','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS','LABCOM_TOKEN'];
  const p=new URLSearchParams();
  ids.forEach(id=>{const el=document.getElementById(id); if(el && el.value!=='') p.append(id, el.value);});
+ document.querySelectorAll('[id^="lab_lo_"],[id^="lab_hi_"],[id^="lab_cad_"],[id^="live_lo_"],[id^="live_hi_"]').forEach(el=>{ if(el.value!=='') p.append(el.id, el.value); });
  const r=await postAction('/config', p.toString()); showToast(r.message, r.ok);
  ['KLEREO_PASSWORD','SMTP_PASS'].forEach(id=>document.getElementById(id).value='');
 }
@@ -1519,8 +1593,14 @@ async function saveConfig(){
 
 def status_payload():
     ph_b = current_bottle("ph")
+    r = kv_get("last_reading") or {}
     return {
         "reading": kv_get("last_reading"),
+        "cl_forecast": bottle_forecast("cl"),
+        "ph_forecast": bottle_forecast("ph"),
+        "ph_range": list(_live_range("ph", r.get("ph_min"), r.get("ph_max"))),
+        "orp_range": list(_live_range("orp", r.get("orp_min"), r.get("orp_max"))),
+        "temp_range": list(_live_range("temp")),
         "last_ok": kv_get("last_ok"),
         "last_error": kv_get("last_error"),
         "bottle_l": kv_get("bottle_l", DEF_BOTTLE),
@@ -1559,18 +1639,29 @@ def lab_latest_payload():
             "ON t.param_key=g.param_key AND t.ts=g.mx ORDER BY t.parameter").fetchall()]
     order = {k: i for i, k in enumerate(
         ["ph", "fc", "tc", "cc", "cya", "alk", "ch", "salt", "br", "po4"])}
-    tests = []
+    now = datetime.now(timezone.utc).astimezone()
+    tests, due = [], 0
     for r in rows:
         _key, label, dec = _param_meta(r["parameter"])
         lo, hi = _lab_range(r["param_key"], r["ideal_low"], r["ideal_high"])
+        days_since = None
+        try:
+            days_since = (now - datetime.fromisoformat(r["ts"])).total_seconds() / 86400.0
+        except (ValueError, TypeError):
+            pass
+        cad = _lab_cadence(r["param_key"])
+        overdue = bool(cad is not None and days_since is not None and days_since > cad)
+        if overdue:
+            due += 1
         tests.append({"key": r["param_key"], "parameter": r["parameter"], "label": label,
                       "dec": dec, "value": r["value"], "unit": r["unit"],
                       "ideal_low": lo, "ideal_high": hi,
-                      "ts": r["ts"], "operator": r["operator"], "comment": r["comment"]})
+                      "ts": r["ts"], "operator": r["operator"], "comment": r["comment"],
+                      "days_since": days_since, "cadence": cad, "overdue": overdue})
     tests.sort(key=lambda t: order.get(t["key"], 99))
     return {"tests": tests, "configured": bool(cfg_get("LABCOM_TOKEN")),
             "last_ok": kv_get("lab_last_ok"), "last_error": kv_get("lab_last_error"),
-            "pool_name": kv_get("lab_pool_name"),
+            "pool_name": kv_get("lab_pool_name"), "due_count": due,
             "poll_hours": kv_get("labcom_poll_hours", 1.0)}
 
 
@@ -1593,6 +1684,59 @@ def lab_history_payload(param_key, days=730):
 
 def lab_raw_payload():
     return kv_get("lab_last_raw") or {}
+
+
+def _pearson(xs, ys):
+    n = len(xs)
+    if n < 3:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if sxx <= 0 or syy <= 0:
+        return None
+    return sxy / (sxx ** 0.5 * syy ** 0.5)
+
+
+LAB_CORR_PROBES = {"orp": "orp", "ph": "ph", "temp": "temp"}
+
+
+def lab_correlation_payload(lab_key="fc", probe="orp", window_h=6.0):
+    """Pair each lab measurement with the nearest Klereo reading (within window_h
+    hours) and return the scatter points + Pearson r. x = lab value, y = probe."""
+    import bisect
+    col = LAB_CORR_PROBES.get(probe, "orp")
+    with db() as c:
+        labs = c.execute("SELECT ts,value FROM lab_tests WHERE param_key=? AND value IS NOT NULL "
+                         "ORDER BY ts", (lab_key,)).fetchall()
+        reads = c.execute(f"SELECT ts,{col} AS pv FROM readings WHERE {col} IS NOT NULL "
+                          "ORDER BY ts").fetchall()
+    R = []
+    for r in reads:
+        try:
+            R.append((datetime.fromisoformat(r["ts"]).timestamp(), r["pv"]))
+        except (ValueError, TypeError):
+            pass
+    Rt = [x[0] for x in R]
+    pts = []
+    for l in labs:
+        try:
+            lt = datetime.fromisoformat(l["ts"]).timestamp()
+        except (ValueError, TypeError):
+            continue
+        i = bisect.bisect_left(Rt, lt)
+        best, bestd = None, None
+        for j in (i - 1, i):
+            if 0 <= j < len(R):
+                d = abs(R[j][0] - lt)
+                if bestd is None or d < bestd:
+                    bestd, best = d, R[j]
+        if best is not None and bestd is not None and bestd <= window_h * 3600:
+            pts.append({"ts": l["ts"], "x": l["value"], "y": best[1]})
+    r = _pearson([p["x"] for p in pts], [p["y"] for p in pts]) if len(pts) >= 3 else None
+    return {"points": pts, "r": r, "n": len(pts), "lab_key": lab_key, "probe": probe}
 
 
 def history_payload(days=1):
@@ -1942,6 +2086,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(lab_history_payload(q.get("param", ["ph"])[0]))
         elif path == "/api/lab-raw":
             self._json(lab_raw_payload())
+        elif path == "/api/lab-correlation":
+            q = parse_qs(urlparse(self.path).query)
+            self._json(lab_correlation_payload(q.get("param", ["fc"])[0],
+                                               q.get("probe", ["orp"])[0]))
         elif path == "/api/raw":
             self._json(raw_payload())
         elif path == "/api/cover-latest.jpg":
@@ -2017,6 +2165,31 @@ class Handler(BaseHTTPRequestHandler):
                 if form.get("ph_final"): kv_set("ph_final_remaining_l", max(0.0, float(form["ph_final"])))
                 if form.get("ph_pump_lph"): kv_set("ph_pump_lph", max(0.0, float(form["ph_pump_lph"])))
                 if form.get("labcom_poll_hours"): kv_set("labcom_poll_hours", max(0.5, float(form["labcom_poll_hours"])))
+                if form.get("bottle_avg_days"): kv_set("bottle_avg_days", max(1, int(float(form["bottle_avg_days"]))))
+                for _k, _lbl in LAB_TARGET_FIELDS:
+                    _lo, _hi = form.get("lab_lo_" + _k), form.get("lab_hi_" + _k)
+                    if _lo not in (None, "") and _hi not in (None, ""):
+                        try:
+                            a, b = float(_lo), float(_hi)
+                            if a < b:
+                                kv_set("lab_range_" + _k, [a, b])
+                        except ValueError:
+                            pass
+                    _cad = form.get("lab_cad_" + _k)
+                    if _cad not in (None, ""):
+                        try:
+                            kv_set("lab_cadence_" + _k, max(1.0, float(_cad)))
+                        except ValueError:
+                            pass
+                for _k in ("ph", "orp", "temp"):
+                    _lo, _hi = form.get("live_lo_" + _k), form.get("live_hi_" + _k)
+                    if _lo not in (None, "") and _hi not in (None, ""):
+                        try:
+                            a, b = float(_lo), float(_hi)
+                            if a < b:
+                                kv_set("live_range_" + _k, [a, b])
+                        except ValueError:
+                            pass
                 if form.get("poll"): kv_set("poll_minutes", max(1.0, float(form["poll"])))
                 if form.get("gpl"): kv_set("liquid_cl_gpl", max(1.0, float(form["gpl"])))
                 if form.get("pump"): kv_set("pump_kw", max(0.0, float(form["pump"])))
