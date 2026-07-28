@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.1.3"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.2.0"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -934,8 +934,13 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,san
 .cardhead .t svg{color:var(--primary)}
 .mut{color:var(--muted)}
 .wq{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
-.chip{background:var(--card2);border-radius:14px;padding:11px 4px;text-align:center;cursor:pointer;border:2px solid transparent;transition:border-color .15s}
+.chip{background:var(--card2);border-radius:14px;padding:10px 3px 11px;text-align:center;cursor:pointer;border:2px solid transparent;transition:border-color .15s}
 .chip.sel{border-color:var(--primary)}
+.gaugewrap{text-align:center;line-height:0}
+.gaugewrap svg{display:inline-block;width:100%;max-width:92px}
+.gval{font-size:19px;font-weight:800;letter-spacing:-.5px;margin-top:-8px}
+.gval small{font-size:10px;color:var(--muted);font-weight:600;margin-left:1px}
+.gname{font-size:12px;font-weight:700;margin-top:2px}
 .chip .dot{width:38px;height:38px;border-radius:50%;margin:0 auto 7px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px}
 .chip .v{font-size:20px;font-weight:800;letter-spacing:-.5px}
 .chip .s{font-size:11px;font-weight:700;margin-top:1px}
@@ -1110,7 +1115,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.1.3</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.2.0</div>
  </div></div>
 
  <div class="tabbar">
@@ -1202,18 +1207,31 @@ function render(){
 // ---------- water quality ----------
 function labTest(k){if(!LAB||!LAB.tests)return null;for(var i=0;i<LAB.tests.length;i++)if(LAB.tests[i].key===k)return LAB.tests[i];return null;}
 function metrics(){var r=(S&&S.reading)||{};var fc=labTest('fc');
- var m={orp:{title:'Redox (ORP)',dot:'ORP',color:'var(--orp)',val:r.orp,unit:'mV',dec:0,lo:(S.orp_range||[])[0],hi:(S.orp_range||[])[1],live:true,src:'orp'},
-   ph:{title:'pH',dot:'pH',color:'var(--ph)',val:r.ph,unit:'',dec:2,lo:(S.ph_range||[])[0],hi:(S.ph_range||[])[1],live:true,src:'ph'},
-   cl:{title:'Free chlorine',dot:'Cl',color:'var(--cl)',val:fc?fc.value:null,unit:fc?(fc.unit||''):'',dec:2,lo:fc?fc.ideal_low:null,hi:fc?fc.ideal_high:null,live:false,ts:fc?fc.ts:null,src:'lab:fc'},
-   temp:{title:'Water temp',dot:'T',color:'var(--temp)',val:r.temp,unit:'C',dec:1,lo:(S.temp_range||[])[0],hi:(S.temp_range||[])[1],live:true,src:'temp'}};
+ var m={orp:{title:'Redox (ORP)',gname:'Redox',dot:'ORP',color:'var(--orp)',val:r.orp,unit:'mV',dec:0,lo:(S.orp_range||[])[0],hi:(S.orp_range||[])[1],live:true,src:'orp'},
+   ph:{title:'pH',gname:'pH',dot:'pH',color:'var(--ph)',val:r.ph,unit:'',dec:2,lo:(S.ph_range||[])[0],hi:(S.ph_range||[])[1],live:true,src:'ph'},
+   cl:{title:'Free chlorine',gname:'Free Cl',dot:'Cl',color:'var(--cl)',val:fc?fc.value:null,unit:fc?(fc.unit||''):'',dec:2,lo:fc?fc.ideal_low:null,hi:fc?fc.ideal_high:null,live:false,ts:fc?fc.ts:null,src:'lab:fc'},
+   temp:{title:'Water temp',gname:'Temp',dot:'T',color:'var(--temp)',val:r.temp,unit:'C',dec:1,lo:(S.temp_range||[])[0],hi:(S.temp_range||[])[1],live:true,src:'temp'}};
  return m;}
 var THERMO='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V5a2 2 0 0 0-4 0v9.76a4 4 0 1 0 4 0z"/></svg>';
+function gaugeSvg(val,lo,hi){
+ if(lo==null||hi==null){return '<svg viewBox="0 0 100 56" style="max-width:92px"><path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="var(--line)" stroke-width="9"/></svg>';}
+ var gmin=lo-(hi-lo)*0.6, gmax=hi+(hi-lo)*0.6, mm=(hi-lo)*0.12;
+ function ang(v){var t=Math.max(0,Math.min(1,(v-gmin)/(gmax-gmin)));return 180*(1-t);}
+ function pt(a,rr){var r=a*Math.PI/180;return [(50+rr*Math.cos(r)).toFixed(2),(50-rr*Math.sin(r)).toFixed(2)];}
+ function seg(v1,v2,col){var p1=pt(ang(v1),40),p2=pt(ang(v2),40);return '<path d="M '+p1[0]+' '+p1[1]+' A 40 40 0 0 1 '+p2[0]+' '+p2[1]+'" fill="none" stroke="'+col+'" stroke-width="9"/>';}
+ var zones=seg(gmin,lo,'#ef4444')+seg(lo,lo+mm,'#eab308')+seg(lo+mm,hi-mm,'#22c55e')+seg(hi-mm,hi,'#eab308')+seg(hi,gmax,'#ef4444');
+ var np=(val==null)?null:pt(ang(val),33);
+ var needle=np?('<line x1="50" y1="50" x2="'+np[0]+'" y2="'+np[1]+'" stroke="var(--text)" stroke-width="2.6" stroke-linecap="round"/>'):'';
+ return '<svg viewBox="0 0 100 56">'+zones+needle+'<circle cx="50" cy="50" r="4" fill="var(--text)"/></svg>';}
 function buildWQ(){var m=metrics();var order=['orp','ph','cl','temp'];
  document.getElementById('wq').innerHTML=order.map(function(k){var x=m[k];var si=statusInfo(x.val,x.lo,x.hi);
-  var dot='<div class="dot" style="background:'+x.color+'">'+(k==='temp'?THERMO:x.dot)+'</div>';
   var val=(x.val==null?'-':(+x.val).toFixed(x.dec));
   var age=x.live?'live':(x.ts?labTime(x.ts):'no test');
-  return '<div class="chip" data-k="'+k+'" onclick="showDetail(this.dataset.k)">'+dot+'<div class="v">'+val+'</div><div class="s '+si.sc+'">'+si.txt+'</div><div class="age">'+age+'</div></div>';
+  return '<div class="chip" data-k="'+k+'" onclick="showDetail(this.dataset.k)">'
+    +'<div class="gaugewrap">'+gaugeSvg(x.val,x.lo,x.hi)+'</div>'
+    +'<div class="gval">'+val+(x.unit?('<small>'+x.unit+'</small>'):'')+'</div>'
+    +'<div class="gname">'+x.gname+'</div>'
+    +'<div class="s '+si.sc+'">'+si.txt+'</div><div class="age">'+age+'</div></div>';
  }).join('');
  if(!curDetail)curDetail='orp';}
 // ---------- balance (slow lab-tested chemistry) ----------
