@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.4.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.5.0"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -920,6 +920,7 @@ PAGE = b"""<!doctype html><html lang="en"><head>
  --ok:#4ade80;--okbg:#12331f;--warn:#fbbf24;--warnbg:#33280f;--bad:#f87171;--badbg:#3a1717;
  --ph:#60a5fa;--cl:#4ade80;--orp:#fbbf24;--temp:#a78bfa}
 *{box-sizing:border-box}
+html,body{overscroll-behavior-y:contain}
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);transition:background .3s,color .3s}
 .app{max-width:480px;margin:0 auto;min-height:100vh;padding:0 0 96px;position:relative}
 .top{display:flex;align-items:center;justify-content:space-between;padding:18px 16px 4px}
@@ -933,7 +934,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,san
 .cardhead .t{display:flex;align-items:center;gap:8px;font-weight:700;font-size:15px}
 .cardhead .t svg{color:var(--primary)}
 .mut{color:var(--muted)}
-.wq{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.wq{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
 .chip{background:var(--card2);border-radius:14px;padding:12px 12px 10px;text-align:left;cursor:pointer;border:2px solid transparent;transition:border-color .15s}
 .chip.sel{border-color:var(--primary)}
 .qlabel{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -954,7 +955,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,san
 .detail .lab{font-size:13px;font-weight:700}
 .spark{flex:1;min-width:0;height:60px}
 .bottles{display:grid;grid-template-columns:1fr;gap:12px}
-.bottle{display:flex;gap:14px;align-items:center}
+.bottle{display:flex;gap:12px;align-items:center;padding-left:6px}
 .bottle .info{flex:1;min-width:0}
 .bhead{display:flex;align-items:center;gap:7px;margin-bottom:2px}
 .bname{font-weight:800;font-size:14px}
@@ -969,8 +970,8 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,san
 .stat svg{color:var(--muted);flex:0 0 auto}
 .stat b{font-size:14px;display:block;line-height:1.15}
 .stat span{color:var(--muted);font-size:11px}
-.btns{display:flex;gap:9px;margin-top:12px}
-.btn{flex:1;border:0;border-radius:11px;padding:11px;font-size:14px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px}
+.btns{display:flex;gap:8px;margin-top:12px}
+.btn{flex:1;border:0;border-radius:11px;padding:11px 6px;font-size:13.5px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap}
 .btn.p{background:var(--primary);color:#fff}
 .btn.s{background:var(--card2);color:var(--text);border:1px solid var(--line)}
 .chartbox{height:150px;display:flex;align-items:flex-end;gap:5px}
@@ -982,6 +983,13 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,san
 .grow .k{color:var(--muted);font-size:13px}
 .grow .v{font-weight:700}
 .pill2{font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;background:var(--badbg);color:var(--bad);text-transform:uppercase}
+.balrow{border-top:1px solid var(--line);padding:11px 2px;cursor:pointer}
+.balrow:first-child{border-top:0}
+.ln1{display:flex;justify-content:space-between;gap:12px;align-items:baseline}
+.ln1 .k{color:var(--text);font-size:14px}
+.ln1 .v{font-weight:700;font-size:15px;text-align:right;white-space:nowrap}
+.ln2{display:flex;justify-content:space-between;gap:12px;align-items:baseline;margin-top:2px;font-size:12px}
+.ln2 .s{font-weight:700}
 .alert{display:flex;gap:12px;align-items:flex-start;padding:14px;border-radius:15px;margin-bottom:10px;background:var(--card);box-shadow:var(--shadow)}
 .alert .ai{width:36px;height:36px;border-radius:11px;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
 .ai.bad{background:var(--badbg);color:var(--bad)} .ai.warn{background:var(--warnbg);color:var(--warn)} .ai.info{background:var(--primarybg);color:var(--primary)}
@@ -1131,7 +1139,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.4.0</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.5.0</div>
  </div></div>
 
  <div class="tabbar">
@@ -1178,7 +1186,7 @@ function labTime(iso){if(!iso)return 'never';var d=new Date(iso);if(isNaN(d))ret
  if(now.toDateString()===d.toDateString())return 'today at '+hm;
  var y=new Date(now);y.setDate(now.getDate()-1);if(y.toDateString()===d.toDateString())return 'yesterday at '+hm;
  var days=Math.floor((now-d)/86400000);if(days<14)return days+' days ago';
- var weeks=Math.round(days/7);if(weeks<9)return weeks+' weeks ago';
+ var weeks=Math.round(days/7);if(weeks<9)return weeks+' wks ago';
  var months=Math.round(days/30.4);return months+' month'+(months===1?'':'s')+' ago';}
 function modeName(m){var n={0:'Manual',1:'Scheduled',2:'Timer',3:'Regulated',4:'Cloned',5:'Special',6:'Test',8:'Pulse'};return m==null?'':(n[m]||('mode '+m));}
 function showToast(msg,ok){var t=document.getElementById('toast');t.textContent=msg;t.className='toast show '+(ok===false?'bad':'ok');clearTimeout(window._tt);window._tt=setTimeout(function(){t.className='toast';},3200);}
@@ -1187,7 +1195,7 @@ function post(url,body){var opt={method:'POST'};if(body){opt.headers={'Content-T
 // ---------- bottle SVG (approved) ----------
 function bottle(pct,c1,c2,topLbl,midLbl){pct=Math.max(0,Math.min(100,pct));
  var by0=55,by1=305,fillTop=90,off=(by1-(by1-fillTop)*pct/100)-by0;var id='b'+Math.random().toString(36).slice(2,7);
- return '<svg viewBox="0 0 210 341" width="104" height="169" xmlns="http://www.w3.org/2000/svg">'
+ return '<svg viewBox="0 0 210 341" width="90" height="146" xmlns="http://www.w3.org/2000/svg">'
  +'<defs><linearGradient id="liq'+id+'" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="'+c1+'"/><stop offset="1" stop-color="'+c2+'"/></linearGradient>'
  +'<mask id="m'+id+'"><rect x="87" y="64" width="107" height="232" rx="13" fill="#fff"/></mask>'
  +'<filter id="s'+id+'" x="-40%" y="-40%" width="180%" height="180%"><feDropShadow dx="0" dy="5" stdDeviation="6" flood-color="#46597a" flood-opacity="0.28"/></filter></defs>'
@@ -1232,11 +1240,12 @@ var THERMO='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="
 function buildWQ(){var m=metrics();var order=['orp','ph','cl','temp'];
  document.getElementById('wq').innerHTML=order.map(function(k){var x=m[k];var si=statusInfo(x.val,x.lo,x.hi);var col=scColor(si.sc);
   var val=(x.val==null?'-':(+x.val).toFixed(x.dec));
+  var unit=(x.unit||'').split(' ')[0];
   var rng=(x.lo!=null&&x.hi!=null)?((+x.lo)+'-'+(+x.hi)):'';
   var age=x.live?'live':(x.ts?labTime(x.ts):'');
   return '<div class="chip" data-k="'+k+'" onclick="showDetail(this.dataset.k)">'
     +'<div class="qlabel">'+x.gname+'</div>'
-    +'<div class="qval" style="color:'+(si.sc?col:'var(--text)')+'">'+val+(x.unit?('<small>'+x.unit+'</small>'):'')+'</div>'
+    +'<div class="qval">'+val+(unit?('<small>'+unit+'</small>'):'')+'</div>'
     +'<div class="qsub"><span class="w" style="color:'+col+'">'+si.txt+'</span>'+(rng?(' <span class="mut">&middot; '+rng+'</span>'):'')+'</div>'
     +(age?('<div class="qage">'+age+'</div>'):'')
     +'<div class="qbar" style="background:'+(si.sc?col:'var(--line)')+'"></div></div>';
@@ -1251,9 +1260,9 @@ function buildBalance(){var sec=document.getElementById('balanceSect');
  items.sort(function(a,b){return (BAL_ORDER.indexOf(a.key)+99)%100-(BAL_ORDER.indexOf(b.key)+99)%100;});
  sec.style.display='block';
  document.getElementById('balanceCard').innerHTML=items.map(function(t){var si=statusInfo(t.value,t.ideal_low,t.ideal_high);
-  return '<div class="grow" data-k="'+t.key+'" onclick="showDetail(this.dataset.k)" style="cursor:pointer">'
-   +'<span class="k" style="color:var(--text)">'+t.label+' <span class="s '+si.sc+'" style="font-size:11px;font-weight:700">'+si.txt+'</span></span>'
-   +'<span class="v">'+(t.value==null?'-':(+t.value).toFixed(t.dec))+' '+(t.unit||'')+' <small class="mut" style="font-weight:400">'+labTime(t.ts)+'</small></span></div>';
+  return '<div class="balrow" data-k="'+t.key+'" onclick="showDetail(this.dataset.k)">'
+   +'<div class="ln1"><span class="k">'+t.label+'</span><span class="v">'+(t.value==null?'-':(+t.value).toFixed(t.dec))+(t.unit?(' '+t.unit):'')+'</span></div>'
+   +'<div class="ln2"><span class="s '+si.sc+'">'+si.txt+'</span><span class="mut">'+labTime(t.ts)+'</span></div></div>';
  }).join('');}
 function metricFor(k){var pr=metrics()[k];if(pr)return pr;var t=labTest(k);if(!t)return null;
  return {title:t.label,color:(BAL_COLOR[k]||'var(--cl)'),val:t.value,unit:t.unit||'',dec:t.dec,lo:t.ideal_low,hi:t.ideal_high,live:false,ts:t.ts,src:'lab:'+k};}
@@ -1425,9 +1434,10 @@ function buildAlerts(){var al=[];var r=(S&&S.reading)||{};
 // ---------- misc ----------
 function labSync(){showToast('Syncing PoolLab...');post('/lab-refresh').then(function(r){showToast(r.message,r.ok);load();});}
 function refresh(){var ptr=document.getElementById('ptr');ptr.textContent='Refreshing...';ptr.style.transform='translateY(0)';
- fetch('/poll-now',{method:'POST'}).catch(function(){}).then(function(){return load();}).then(function(){ptr.style.transform='translateY(-40px)';setTimeout(function(){ptr.textContent='\u2193 pull to refresh';},300);});}
+ fetch('/poll-now',{method:'POST'}).catch(function(){}).then(function(){return load();}).then(function(){ptr.style.transform='translateY(-40px)';setTimeout(function(){ptr.textContent='\\u2193 pull to refresh';},300);});}
 var ptrStart=null;
-addEventListener('touchstart',function(e){ptrStart=(scrollY<=0)?e.touches[0].clientY:null;},{passive:true});
+function atTop(){return (window.scrollY||(document.scrollingElement||document.documentElement).scrollTop||0)<=0;}
+addEventListener('touchstart',function(e){ptrStart=atTop()?e.touches[0].clientY:null;},{passive:true});
 addEventListener('touchmove',function(e){if(ptrStart==null)return;var dy=e.touches[0].clientY-ptrStart;if(dy>0)document.getElementById('ptr').style.transform='translateY('+Math.min(dy-40,12)+'px)';},{passive:true});
 addEventListener('touchend',function(e){if(ptrStart==null)return;var dy=e.changedTouches[0].clientY-ptrStart;if(dy>70)refresh();else document.getElementById('ptr').style.transform='translateY(-40px)';ptrStart=null;},{passive:true});
 load();setInterval(load,60000);
