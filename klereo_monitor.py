@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.1.1"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.1.2"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -1108,7 +1108,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.1.1</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.1.2</div>
  </div></div>
 
  <div class="tabbar">
@@ -1154,8 +1154,9 @@ function friendlyTime(iso){if(!iso)return 'never';var d=new Date(iso);if(isNaN(d
 function labTime(iso){if(!iso)return 'never';var d=new Date(iso);if(isNaN(d))return iso;var now=new Date();var hm=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
  if(now.toDateString()===d.toDateString())return 'today at '+hm;
  var y=new Date(now);y.setDate(now.getDate()-1);if(y.toDateString()===d.toDateString())return 'yesterday at '+hm;
- var days=Math.floor((now-d)/86400000);if(days<7)return days+' days ago';
- var opt={day:'numeric',month:'short'};if(d.getFullYear()!==now.getFullYear())opt.year='numeric';return d.toLocaleDateString([],opt)+' at '+hm;}
+ var days=Math.floor((now-d)/86400000);if(days<14)return days+' days ago';
+ var weeks=Math.round(days/7);if(weeks<9)return weeks+' weeks ago';
+ var months=Math.round(days/30.4);return months+' month'+(months===1?'':'s')+' ago';}
 function modeName(m){var n={0:'Manual',1:'Scheduled',2:'Timer',3:'Regulated',4:'Cloned',5:'Special',6:'Test',8:'Pulse'};return m==null?'':(n[m]||('mode '+m));}
 function showToast(msg,ok){var t=document.getElementById('toast');t.textContent=msg;t.className='toast show '+(ok===false?'bad':'ok');clearTimeout(window._tt);window._tt=setTimeout(function(){t.className='toast';},3200);}
 function post(url,body){var opt={method:'POST'};if(body){opt.headers={'Content-Type':'application/x-www-form-urlencoded'};opt.body=body;}return fetch(url,opt).then(function(r){return r.json();}).catch(function(){return {ok:false,message:'Network error'};});}
