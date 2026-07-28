@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.0.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.0.1"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -1042,12 +1042,12 @@ a{color:var(--primary)}
    </div>
    <div class="card" id="detailCard" style="display:none">
      <div class="cardhead"><div class="t"><span id="dIcon"></span><span id="dTitle"></span></div><span class="mut" id="dAge"></span></div>
-     <div class="detail">
-       <div><div class="big"><span id="dVal">-</span><small id="dUnit"></small></div>
-         <div class="lab" id="dStatus"></div>
-         <div class="mut" id="dRange" style="font-size:12px;margin-top:2px"></div></div>
-       <div class="spark" id="dSpark"></div>
+     <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:8px">
+       <div class="big"><span id="dVal">-</span><small id="dUnit"></small></div>
+       <div class="lab" id="dStatus"></div>
+       <div class="mut" id="dRange" style="font-size:12px;margin-left:auto"></div>
      </div>
+     <div style="position:relative;height:180px"><canvas id="dChart"></canvas></div>
    </div>
 
    <div class="sect">Bottles</div>
@@ -1103,7 +1103,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.0.0</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.0.1</div>
  </div></div>
 
  <div class="tabbar">
@@ -1132,7 +1132,10 @@ function go(p){document.querySelectorAll('.page').forEach(function(x){x.classLis
 
 // ---------- helpers ----------
 function zone(v,lo,hi){if(v==null||lo==null||hi==null)return '';if(v<lo||v>hi)return 'bad';var m=(hi-lo)*0.12;return (v<=lo+m||v>=hi-m)?'warn':'ok';}
-function statusWord(sc){return sc==='bad'?'Out':(sc==='warn'?'Watch':(sc==='ok'?'Ideal':''));}
+function statusInfo(v,lo,hi){if(v==null||lo==null||hi==null)return {sc:'',txt:'--'};
+ if(v<lo)return {sc:'bad',txt:'Too low'};if(v>hi)return {sc:'bad',txt:'Too high'};
+ var m=(hi-lo)*0.12;if(v<=lo+m)return {sc:'warn',txt:'Low'};if(v>=hi-m)return {sc:'warn',txt:'High'};
+ return {sc:'ok',txt:'Ideal'};}
 function scColor(sc){return sc==='bad'?'var(--bad)':(sc==='warn'?'var(--warn)':'var(--ok)');}
 function fmtDate(iso){var d=new Date((''+iso).length<=10?iso+'T00:00:00':iso);if(isNaN(d))return iso;return d.toLocaleDateString([],{day:'numeric',month:'short'});}
 function friendlyTime(iso){if(!iso)return 'never';var d=new Date(iso);if(isNaN(d))return iso;var now=new Date(),s=(now-d)/1000;var hm=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
@@ -1191,11 +1194,11 @@ function metrics(){var r=(S&&S.reading)||{};var fc=labTest('fc');
  return m;}
 var THERMO='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V5a2 2 0 0 0-4 0v9.76a4 4 0 1 0 4 0z"/></svg>';
 function buildWQ(){var m=metrics();var order=['orp','ph','cl','temp'];
- document.getElementById('wq').innerHTML=order.map(function(k){var x=m[k];var sc=zone(x.val,x.lo,x.hi);
+ document.getElementById('wq').innerHTML=order.map(function(k){var x=m[k];var si=statusInfo(x.val,x.lo,x.hi);
   var dot='<div class="dot" style="background:'+x.color+'">'+(k==='temp'?THERMO:x.dot)+'</div>';
   var val=(x.val==null?'-':(+x.val).toFixed(x.dec));
   var age=x.live?'live':(x.ts?friendlyTime(x.ts):'no test');
-  return '<div class="chip" data-k="'+k+'" onclick="showDetail(this.dataset.k)">'+dot+'<div class="v">'+val+'</div><div class="s '+sc+'">'+(sc?statusWord(sc):'--')+'</div><div class="age">'+age+'</div></div>';
+  return '<div class="chip" data-k="'+k+'" onclick="showDetail(this.dataset.k)">'+dot+'<div class="v">'+val+'</div><div class="s '+si.sc+'">'+si.txt+'</div><div class="age">'+age+'</div></div>';
  }).join('');
  if(!curDetail)curDetail='orp';}
 var curDetail=null, detailChart=null;
@@ -1206,23 +1209,32 @@ function showDetail(k){curDetail=k;var m=metrics()[k];if(!m)return;
  document.getElementById('dTitle').textContent=m.title;
  document.getElementById('dVal').textContent=(m.val==null?'-':(+m.val).toFixed(m.dec));
  document.getElementById('dUnit').innerHTML=m.unit?(' '+m.unit):'';
- var sc=zone(m.val,m.lo,m.hi);var ds=document.getElementById('dStatus');ds.textContent=sc?statusWord(sc):'';ds.style.color=scColor(sc);
+ var si=statusInfo(m.val,m.lo,m.hi);var ds=document.getElementById('dStatus');ds.textContent=si.txt;ds.style.color=scColor(si.sc);
  document.getElementById('dRange').textContent=(m.lo!=null&&m.hi!=null)?('target '+(+m.lo)+'-'+(+m.hi)+(m.unit?(' '+m.unit):'')):'';
  document.getElementById('dAge').textContent=m.live?'live':(m.ts?('measured '+friendlyTime(m.ts)):'');
- var url=m.src.indexOf('lab:')===0?('/api/lab-history?param='+m.src.slice(4)):('/api/history?days=7');
+ var isLab=m.src.indexOf('lab:')===0;
+ var url=isLab?('/api/lab-history?param='+m.src.slice(4)):('/api/history?days=7');
  fetch(url).then(function(r){return r.json();}).then(function(h){
-   var series,fmt;
-   if(m.src.indexOf('lab:')===0){series=h.map(function(x){return {t:x.ts,v:x.value};});}
-   else{series=h.map(function(x){return {t:x.ts,v:x[m.src]};}).filter(function(x){return x.v!=null;});}
-   drawSpark('dSpark',series,m.color);
- }).catch(function(){drawSpark('dSpark',[],m.color);});}
-function drawSpark(id,series,color){var el=document.getElementById(id);var vals=series.map(function(x){return x.v;});
- if(!vals.length){el.innerHTML='<div class="mut" style="font-size:12px;padding-top:20px">no history yet</div>';return;}
- var w=220,h=60,max=Math.max.apply(null,vals),min=Math.min.apply(null,vals),rng=(max-min)||1;
- var pts=vals.map(function(v,i){return [8+i*(w-16)/Math.max(vals.length-1,1),h-8-((v-min)/rng)*(h-18)];});
- var d=pts.map(function(p,i){return (i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1);}).join(' ');
- var area=d+' L '+pts[pts.length-1][0].toFixed(1)+' '+h+' L 8 '+h+' Z';
- el.innerHTML='<svg width="100%" height="'+h+'" viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none"><path d="'+area+'" fill="'+color+'" opacity=".14"/><path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';}
+   var series=isLab?h.map(function(x){return {t:x.ts,v:x.value};})
+                   :h.map(function(x){return {t:x.ts,v:x[m.src]};}).filter(function(x){return x.v!=null;});
+   drawDetailChart(series,m.color,m.unit,m.lo,m.hi,isLab);
+ }).catch(function(){drawDetailChart([],m.color,m.unit,m.lo,m.hi,isLab);});}
+function drawDetailChart(series,color,unit,lo,hi,isLab){
+ var tc=getComputedStyle(document.documentElement).getPropertyValue('--muted');
+ var gc=getComputedStyle(document.documentElement).getPropertyValue('--line');
+ if(detailChart){detailChart.destroy();detailChart=null;}
+ var cv=document.getElementById('dChart');
+ if(!series.length){var ctx=cv.getContext('2d');ctx.clearRect(0,0,cv.width,cv.height);return;}
+ var labels=series.map(function(x){var d=new Date(x.t);if(isNaN(d))return x.t;
+   return isLab? d.toLocaleDateString([],{day:'numeric',month:'short'})
+              : d.toLocaleString([],{hour:'2-digit',minute:'2-digit',day:'numeric',month:'short'});});
+ var ds=[{label:unit||'value',data:series.map(function(x){return x.v;}),borderColor:color,backgroundColor:color,borderWidth:2,tension:.25,pointRadius:isLab?3:0,fill:false}];
+ if(lo!=null)ds.push({label:'min',data:series.map(function(){return lo;}),borderColor:tc,borderDash:[5,4],borderWidth:1,pointRadius:0});
+ if(hi!=null)ds.push({label:'max',data:series.map(function(){return hi;}),borderColor:tc,borderDash:[5,4],borderWidth:1,pointRadius:0});
+ var opts={responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+   plugins:{legend:{display:false},tooltip:{enabled:true,callbacks:{label:function(c){return c.parsed.y;}}}},
+   scales:{y:{grid:{color:gc},ticks:{color:tc}},x:{ticks:{maxTicksLimit:6,color:tc,maxRotation:0,autoSkip:true},grid:{display:false}}}};
+ detailChart=new Chart(cv,{type:'line',data:{labels:labels,datasets:ds},options:opts});}
 
 // ---------- bottles ----------
 var CHEM={cl:{name:'Chlorine',c1:'#63aef5',c2:'#3778d4'},ph:{name:'pH-minus',c1:'#f7c65e',c2:'#e79328'}};
@@ -1286,7 +1298,7 @@ function buildLabList(){var c=document.getElementById('labListCard');if(!LAB||!L
  document.getElementById('labWhen').textContent=(LAB.last_ok?('updated '+friendlyTime(LAB.last_ok)):'')+(LAB.due_count?('  |  '+LAB.due_count+' due'):'');
  document.getElementById('labList').innerHTML=LAB.tests.map(function(t){var sc=zone(t.value,t.ideal_low,t.ideal_high);var due=t.overdue?(' <span class="pill2">'+overdueTxt(t)+'</span>'):'';
   return '<div class="grow" data-k="'+t.key+'" onclick="openLabGrid(this.dataset.k)" style="cursor:pointer"><span class="k">'+t.label+due+'</span><span class="v" style="color:'+(sc?scColor(sc):'inherit')+'">'+(t.value==null?'-':(+t.value).toFixed(t.dec))+' <small class="mut">'+friendlyTime(t.ts)+'</small></span></div>';}).join('');}
-function overdueTxt(t){if(t.days_since==null||t.cadence==null)return 'due';var d=Math.round(t.days_since-t.cadence);return d>0?(d+' day'+(d===1?'':'s')+' over'):'due';}
+function overdueTxt(t){if(t.days_since==null||t.cadence==null)return 'due';var d=Math.round(t.days_since-t.cadence);return d>0?(d+' day'+(d===1?'':'s')+' overdue'):'due';}
 function openLabGrid(k){var t=labTest(k)||{};document.getElementById('labGridTitle').textContent=(t.label||k)+' - all readings';document.getElementById('labGridBody').innerHTML='loading...';document.getElementById('labGridModal').classList.add('show');
  fetch('/api/lab-history?param='+encodeURIComponent(k)).then(function(r){return r.json();}).then(function(rows){rows=(rows||[]).slice().reverse();var b=document.getElementById('labGridBody');if(!rows.length){b.innerHTML='<div class="mut">No readings.</div>';return;}var dec=t.dec==null?2:t.dec,unit=t.unit||'';
   b.innerHTML=rows.map(function(x){return '<div style="display:flex;justify-content:space-between;gap:10px;border-top:1px solid var(--line);padding:8px 0"><span class="mut">'+friendlyTime(x.ts)+'</span><b>'+(x.value==null?'-':(+x.value).toFixed(dec))+' '+unit+'</b></div>';}).join('');}).catch(function(){});}
@@ -1327,7 +1339,7 @@ function loadCorr(){buildCorrSeg();drawCorr();}
 function drawCorr(){if(document.getElementById('corrCard').style.display==='none')return;fetch('/api/lab-correlation?param='+corrParam+'&probe='+corrProbe).then(function(r){return r.json();}).then(function(d){
  var tc=getComputedStyle(document.documentElement).getPropertyValue('--muted');var gc=getComputedStyle(document.documentElement).getPropertyValue('--line');
  var lt=(labTest(corrParam)||{}).label||corrParam.toUpperCase();var pts=(d.points||[]).map(function(p){return {x:p.x,y:p.y};});
- var rtxt=(d.r==null)?'not enough paired data yet':('r = '+d.r.toFixed(2)+' (n='+d.n+', '+corrStrength(d.r)+')');
+ var rtxt=(d.r==null)?('not enough paired data yet ('+(d.n||0)+' points; needs 3+ lab tests taken while the monitor is running)'):('r = '+d.r.toFixed(2)+' (n='+d.n+', '+corrStrength(d.r)+')');
  document.getElementById('corrSummary').textContent=lt+' vs '+PROBEL[corrProbe]+' - '+rtxt;
  var data={datasets:[{data:pts,backgroundColor:'#38bdf8',pointRadius:4}]};
  var opts={responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{title:{display:true,text:lt,color:tc},grid:{color:gc},ticks:{color:tc}},y:{title:{display:true,text:PROBEL[corrProbe],color:tc},grid:{color:gc},ticks:{color:tc}}}};
@@ -1703,7 +1715,7 @@ def _pearson(xs, ys):
 LAB_CORR_PROBES = {"orp": "orp", "ph": "ph", "temp": "temp"}
 
 
-def lab_correlation_payload(lab_key="fc", probe="orp", window_h=6.0):
+def lab_correlation_payload(lab_key="fc", probe="orp", window_h=12.0):
     """Pair each lab measurement with the nearest Klereo reading (within window_h
     hours) and return the scatter points + Pearson r. x = lab value, y = probe."""
     import bisect
