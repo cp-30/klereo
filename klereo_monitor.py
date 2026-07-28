@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.7.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.7.1"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -1075,9 +1075,9 @@ a{color:var(--primary)}
  .wrap>.span,.wrap>.bottles,.wrap>#alertsBody,.wrap>#wqCard,.wrap>.mut{grid-column:1/-1}
  .wrap>.bottles{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
  /* rows share height for a uniform grid */
- #detailCard,#balanceSect,#filtCard,#dashAlerts{align-self:stretch}
- #balanceSect{display:flex;flex-direction:column;margin-bottom:0}
- #balanceCard{flex:1;display:flex;flex-direction:column;justify-content:center;margin-bottom:0}
+ #detailCard,#balanceCard,#filtCard,#dashAlerts{align-self:stretch}
+ #balanceCard{display:flex;flex-direction:column;margin-bottom:0}
+ #balanceBody{flex:1;display:flex;flex-direction:column;justify-content:center}
  #errbox{max-width:1080px;margin:0 auto}
  .tabbar{max-width:660px;border-radius:16px 16px 0 0}
  .wq{grid-template-columns:repeat(4,1fr)}
@@ -1141,9 +1141,9 @@ a{color:var(--primary)}
      <div style="position:relative;height:180px"><canvas id="dChart"></canvas></div>
    </div>
 
-   <div id="balanceSect" style="display:none">
-     <div class="sect">Balance <span style="text-transform:none;font-weight:400;letter-spacing:0">(lab tests)</span></div>
-     <div class="card" id="balanceCard"></div>
+   <div class="card" id="balanceCard" style="display:none">
+     <div class="cardhead"><div class="t">Balance <span class="mut" style="font-weight:400;font-size:12px;text-transform:none;letter-spacing:0">(lab tests)</span></div></div>
+     <div id="balanceBody"></div>
    </div>
 
    <div class="sect">Bottles</div>
@@ -1203,7 +1203,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.7.0</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.7.1</div>
  </div></div>
 
  <div class="tabbar">
@@ -1341,12 +1341,12 @@ function buildWQ(){var m=metrics();var order=['orp','ph','cl','temp'];
 // ---------- balance (slow lab-tested chemistry) ----------
 var BAL_ORDER=['cya','alk','ch','tc','cc','salt','br','po4'];
 var BAL_COLOR={cya:'#8b5cf6',alk:'#14b8a6',ch:'#a16207',tc:'#0ea5e9',cc:'#f43f5e',salt:'#0891b2',br:'#7c3aed',po4:'#65a30d'};
-function buildBalance(){var sec=document.getElementById('balanceSect');
+function buildBalance(){var card=document.getElementById('balanceCard');
  var items=(LAB&&LAB.tests)?LAB.tests.filter(function(t){return t.key!=='fc';}):[];
- if(!LAB||!LAB.configured||!items.length){sec.style.display='none';return;}
+ if(!LAB||!LAB.configured||!items.length){card.style.display='none';return;}
  items.sort(function(a,b){return (BAL_ORDER.indexOf(a.key)+99)%100-(BAL_ORDER.indexOf(b.key)+99)%100;});
- sec.style.display='block';
- document.getElementById('balanceCard').innerHTML=items.map(function(t){var si=statusInfo(t.value,t.ideal_low,t.ideal_high);
+ card.style.display='';
+ document.getElementById('balanceBody').innerHTML=items.map(function(t){var si=statusInfo(t.value,t.ideal_low,t.ideal_high);
   return '<div class="balrow" data-k="'+t.key+'" onclick="showDetail(this.dataset.k)">'
    +'<div class="ln1"><span class="k">'+t.label+'</span><span class="v">'+(t.value==null?'-':(+t.value).toFixed(t.dec))+(t.unit?(' '+t.unit):'')+'</span></div>'
    +'<div class="ln2"><span class="s '+si.sc+'">'+si.txt+'</span><span class="mut">'+labTime(t.ts)+'</span></div></div>';
