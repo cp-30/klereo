@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.1.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.1.1"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -1108,7 +1108,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.1.0</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.1.1</div>
  </div></div>
 
  <div class="tabbar">
@@ -1150,6 +1150,11 @@ function friendlyTime(iso){if(!iso)return 'never';var d=new Date(iso);if(isNaN(d
  if(now.toDateString()===d.toDateString()){var h=Math.floor(s/3600);return h+' hour'+(h===1?'':'s')+' ago';}
  var y=new Date(now);y.setDate(now.getDate()-1);if(y.toDateString()===d.toDateString())return 'yesterday at '+hm;
  var days=Math.floor(s/86400);if(days<=7)return days+' days ago at '+hm;
+ var opt={day:'numeric',month:'short'};if(d.getFullYear()!==now.getFullYear())opt.year='numeric';return d.toLocaleDateString([],opt)+' at '+hm;}
+function labTime(iso){if(!iso)return 'never';var d=new Date(iso);if(isNaN(d))return iso;var now=new Date();var hm=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+ if(now.toDateString()===d.toDateString())return 'today at '+hm;
+ var y=new Date(now);y.setDate(now.getDate()-1);if(y.toDateString()===d.toDateString())return 'yesterday at '+hm;
+ var days=Math.floor((now-d)/86400000);if(days<7)return days+' days ago';
  var opt={day:'numeric',month:'short'};if(d.getFullYear()!==now.getFullYear())opt.year='numeric';return d.toLocaleDateString([],opt)+' at '+hm;}
 function modeName(m){var n={0:'Manual',1:'Scheduled',2:'Timer',3:'Regulated',4:'Cloned',5:'Special',6:'Test',8:'Pulse'};return m==null?'':(n[m]||('mode '+m));}
 function showToast(msg,ok){var t=document.getElementById('toast');t.textContent=msg;t.className='toast show '+(ok===false?'bad':'ok');clearTimeout(window._tt);window._tt=setTimeout(function(){t.className='toast';},3200);}
@@ -1204,7 +1209,7 @@ function buildWQ(){var m=metrics();var order=['orp','ph','cl','temp'];
  document.getElementById('wq').innerHTML=order.map(function(k){var x=m[k];var si=statusInfo(x.val,x.lo,x.hi);
   var dot='<div class="dot" style="background:'+x.color+'">'+(k==='temp'?THERMO:x.dot)+'</div>';
   var val=(x.val==null?'-':(+x.val).toFixed(x.dec));
-  var age=x.live?'live':(x.ts?friendlyTime(x.ts):'no test');
+  var age=x.live?'live':(x.ts?labTime(x.ts):'no test');
   return '<div class="chip" data-k="'+k+'" onclick="showDetail(this.dataset.k)">'+dot+'<div class="v">'+val+'</div><div class="s '+si.sc+'">'+si.txt+'</div><div class="age">'+age+'</div></div>';
  }).join('');
  if(!curDetail)curDetail='orp';}
@@ -1219,7 +1224,7 @@ function buildBalance(){var sec=document.getElementById('balanceSect');
  document.getElementById('balanceCard').innerHTML=items.map(function(t){var si=statusInfo(t.value,t.ideal_low,t.ideal_high);
   return '<div class="grow" data-k="'+t.key+'" onclick="showDetail(this.dataset.k)" style="cursor:pointer">'
    +'<span class="k" style="color:var(--text)">'+t.label+' <span class="s '+si.sc+'" style="font-size:11px;font-weight:700">'+si.txt+'</span></span>'
-   +'<span class="v">'+(t.value==null?'-':(+t.value).toFixed(t.dec))+' '+(t.unit||'')+' <small class="mut" style="font-weight:400">'+friendlyTime(t.ts)+'</small></span></div>';
+   +'<span class="v">'+(t.value==null?'-':(+t.value).toFixed(t.dec))+' '+(t.unit||'')+' <small class="mut" style="font-weight:400">'+labTime(t.ts)+'</small></span></div>';
  }).join('');}
 function metricFor(k){var pr=metrics()[k];if(pr)return pr;var t=labTest(k);if(!t)return null;
  return {title:t.label,color:(BAL_COLOR[k]||'var(--cl)'),val:t.value,unit:t.unit||'',dec:t.dec,lo:t.ideal_low,hi:t.ideal_high,live:false,ts:t.ts,src:'lab:'+k};}
@@ -1234,7 +1239,7 @@ function showDetail(k){curDetail=k;var m=metricFor(k);if(!m)return;
  var si=statusInfo(m.val,m.lo,m.hi);var ds=document.getElementById('dStatus');ds.textContent=si.txt;ds.style.color=scColor(si.sc);
  document.getElementById('dRange').textContent=(m.lo!=null&&m.hi!=null)?('target '+(+m.lo)+'-'+(+m.hi)+(m.unit?(' '+m.unit):'')):'';
  if(k==='cl'){var cya=labTest('cya');if(cya&&cya.value!=null){var dr=document.getElementById('dRange');dr.textContent=(dr.textContent?dr.textContent+'  |  ':'')+'CYA '+(+cya.value).toFixed(0);}}
- document.getElementById('dAge').textContent=m.live?'live':(m.ts?('measured '+friendlyTime(m.ts)):'');
+ document.getElementById('dAge').textContent=m.live?'live':(m.ts?('measured '+labTime(m.ts)):'');
  var isLab=m.src.indexOf('lab:')===0;
  var url=isLab?('/api/lab-history?param='+m.src.slice(4)):('/api/history?days=7');
  fetch(url).then(function(r){return r.json();}).then(function(h){
@@ -1321,11 +1326,11 @@ function histDelete(id){post('/api/bottle-delete','id='+id).then(function(r){sho
 function buildLabList(){var c=document.getElementById('labListCard');if(!LAB||!LAB.configured||!LAB.tests||!LAB.tests.length){c.style.display='none';return;}c.style.display='block';
  document.getElementById('labWhen').textContent=(LAB.last_ok?('updated '+friendlyTime(LAB.last_ok)):'')+(LAB.due_count?('  |  '+LAB.due_count+' due'):'');
  document.getElementById('labList').innerHTML=LAB.tests.map(function(t){var sc=zone(t.value,t.ideal_low,t.ideal_high);var due=t.overdue?(' <span class="pill2">'+overdueTxt(t)+'</span>'):'';
-  return '<div class="grow" data-k="'+t.key+'" onclick="openLabGrid(this.dataset.k)" style="cursor:pointer"><span class="k">'+t.label+due+'</span><span class="v" style="color:'+(sc?scColor(sc):'inherit')+'">'+(t.value==null?'-':(+t.value).toFixed(t.dec))+' <small class="mut">'+friendlyTime(t.ts)+'</small></span></div>';}).join('');}
+  return '<div class="grow" data-k="'+t.key+'" onclick="openLabGrid(this.dataset.k)" style="cursor:pointer"><span class="k">'+t.label+due+'</span><span class="v" style="color:'+(sc?scColor(sc):'inherit')+'">'+(t.value==null?'-':(+t.value).toFixed(t.dec))+' <small class="mut">'+labTime(t.ts)+'</small></span></div>';}).join('');}
 function overdueTxt(t){if(t.days_since==null||t.cadence==null)return 'due';var d=Math.round(t.days_since-t.cadence);return d>0?(d+' day'+(d===1?'':'s')+' overdue'):'due';}
 function openLabGrid(k){var t=labTest(k)||{};document.getElementById('labGridTitle').textContent=(t.label||k)+' - all readings';document.getElementById('labGridBody').innerHTML='loading...';document.getElementById('labGridModal').classList.add('show');
  fetch('/api/lab-history?param='+encodeURIComponent(k)).then(function(r){return r.json();}).then(function(rows){rows=(rows||[]).slice().reverse();var b=document.getElementById('labGridBody');if(!rows.length){b.innerHTML='<div class="mut">No readings.</div>';return;}var dec=t.dec==null?2:t.dec,unit=t.unit||'';
-  b.innerHTML=rows.map(function(x){return '<div style="display:flex;justify-content:space-between;gap:10px;border-top:1px solid var(--line);padding:8px 0"><span class="mut">'+friendlyTime(x.ts)+'</span><b>'+(x.value==null?'-':(+x.value).toFixed(dec))+' '+unit+'</b></div>';}).join('');}).catch(function(){});}
+  b.innerHTML=rows.map(function(x){return '<div style="display:flex;justify-content:space-between;gap:10px;border-top:1px solid var(--line);padding:8px 0"><span class="mut">'+labTime(x.ts)+'</span><b>'+(x.value==null?'-':(+x.value).toFixed(dec))+' '+unit+'</b></div>';}).join('');}).catch(function(){});}
 function closeLabGrid(){document.getElementById('labGridModal').classList.remove('show');}
 
 // ---------- history charts ----------
