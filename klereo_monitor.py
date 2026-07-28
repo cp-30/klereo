@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "1.1.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "1.1.1"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -164,6 +164,11 @@ def init_db():
     if kv_get("currency")         is None: kv_set("currency", "EUR")
     # PoolLab / LabCom lab-test sync
     if kv_get("labcom_poll_hours") is None: kv_set("labcom_poll_hours", 1.0)
+    # re-key any lab rows stored before a parameter was added to LAB_PARAMS
+    with db() as c:
+        for pname, meta in LAB_PARAMS.items():
+            c.execute("UPDATE lab_tests SET param_key=? WHERE parameter=? AND param_key<>?",
+                      (meta["key"], pname, meta["key"]))
     # one-time migration: fold the old single chlorine baseline into bottles[]
     _migrate_legacy_bottle()
 
@@ -609,6 +614,7 @@ LAB_PARAMS = {
     "PL pH":             {"key": "ph",   "label": "pH",           "dec": 2},
     "PL Chlorine Free":  {"key": "fc",   "label": "Free chlorine","dec": 2},
     "PL Chlorine Total": {"key": "tc",   "label": "Total chlorine","dec": 2},
+    "PL Chlorine Combined": {"key": "cc","label": "Combined chlorine", "dec": 2},
     "PL Cyanuric Acid":  {"key": "cya",  "label": "Cyanuric acid (CYA)", "dec": 0},
     "PL T-Alka":         {"key": "alk",  "label": "Total alkalinity",    "dec": 0},
     "PL Calcium Hardness": {"key": "ch", "label": "Calcium hardness","dec": 0},
@@ -616,6 +622,29 @@ LAB_PARAMS = {
     "PL Bromine":        {"key": "br",   "label": "Bromine",      "dec": 2},
     "PL Phosphate":      {"key": "po4",  "label": "Phosphate",    "dec": 2},
 }
+
+# Sensible target bands used when LabCom has no ideal range set (ideal_* = -1).
+# Standard outdoor liquid-chlorine pool targets; can be made configurable later.
+LAB_DEFAULT_RANGES = {
+    "ph":  (7.0, 7.6),
+    "fc":  (1.0, 3.0),
+    "tc":  (1.0, 3.0),
+    "cc":  (0.0, 0.2),      # combined chlorine (chloramines): keep low
+    "cya": (30.0, 50.0),
+    "alk": (80.0, 120.0),
+    "ch":  (200.0, 400.0),
+}
+
+
+def _lab_range(key, api_low, api_high):
+    """Effective (low, high): the LabCom ideal if actually set, else a default.
+    LabCom uses -1 / 'NOT SET' when no range is configured."""
+    def _ok(x):
+        return x is not None and x > -0.5
+    if _ok(api_low) and _ok(api_high) and api_low < api_high:
+        return api_low, api_high
+    lo, hi = LAB_DEFAULT_RANGES.get(key, (None, None))
+    return lo, hi
 
 
 def _param_meta(parameter):
@@ -1529,13 +1558,14 @@ def lab_latest_payload():
             "(SELECT param_key, MAX(ts) AS mx FROM lab_tests GROUP BY param_key) g "
             "ON t.param_key=g.param_key AND t.ts=g.mx ORDER BY t.parameter").fetchall()]
     order = {k: i for i, k in enumerate(
-        ["ph", "fc", "tc", "cya", "alk", "ch", "salt", "br", "po4"])}
+        ["ph", "fc", "tc", "cc", "cya", "alk", "ch", "salt", "br", "po4"])}
     tests = []
     for r in rows:
         _key, label, dec = _param_meta(r["parameter"])
+        lo, hi = _lab_range(r["param_key"], r["ideal_low"], r["ideal_high"])
         tests.append({"key": r["param_key"], "parameter": r["parameter"], "label": label,
                       "dec": dec, "value": r["value"], "unit": r["unit"],
-                      "ideal_low": r["ideal_low"], "ideal_high": r["ideal_high"],
+                      "ideal_low": lo, "ideal_high": hi,
                       "ts": r["ts"], "operator": r["operator"], "comment": r["comment"]})
     tests.sort(key=lambda t: order.get(t["key"], 99))
     return {"tests": tests, "configured": bool(cfg_get("LABCOM_TOKEN")),
@@ -1551,7 +1581,14 @@ def lab_history_payload(param_key, days=730):
         rows = c.execute("SELECT ts,value,ideal_low,ideal_high FROM lab_tests "
                          "WHERE param_key=? AND ts>=? AND value IS NOT NULL ORDER BY ts",
                          (param_key, cutoff)).fetchall()
-    return [dict(r) for r in rows]
+    lo, hi = _lab_range(param_key, None, None)   # default band for the guide lines
+    out = []
+    for r in rows:
+        d = dict(r)
+        elo, ehi = _lab_range(param_key, d.get("ideal_low"), d.get("ideal_high"))
+        d["ideal_low"], d["ideal_high"] = elo, ehi
+        out.append(d)
+    return out
 
 
 def lab_raw_payload():
