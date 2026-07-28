@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.0.2"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.1.0"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -1050,6 +1050,11 @@ a{color:var(--primary)}
      <div style="position:relative;height:180px"><canvas id="dChart"></canvas></div>
    </div>
 
+   <div id="balanceSect" style="display:none">
+     <div class="sect">Balance <span style="text-transform:none;font-weight:400;letter-spacing:0">(lab tests)</span></div>
+     <div class="card" id="balanceCard"></div>
+   </div>
+
    <div class="sect">Bottles</div>
    <div class="bottles" id="bottles"></div>
 
@@ -1103,7 +1108,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.0.2</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.1.0</div>
  </div></div>
 
  <div class="tabbar">
@@ -1180,7 +1185,7 @@ function render(){
  document.getElementById('nick').textContent=r.nickname||'';
  document.getElementById('sub').textContent='Updated '+friendlyTime(S.last_ok)+'  |  every '+S.poll_minutes+' min';
  document.getElementById('errbox').innerHTML=S.last_error?('<div class="wrap"><div class="err">Last error: '+S.last_error+'</div></div>'):'';
- buildWQ(); buildBottles(); buildFilt(); buildLabList(); buildAlerts();
+ buildWQ(); buildBalance(); buildBottles(); buildFilt(); buildLabList(); buildAlerts();
  if(curDetail)showDetail(curDetail);
  animateLiquid();
  drawPhOrp(); loadUsage(); loadCorr();
@@ -1203,8 +1208,23 @@ function buildWQ(){var m=metrics();var order=['orp','ph','cl','temp'];
   return '<div class="chip" data-k="'+k+'" onclick="showDetail(this.dataset.k)">'+dot+'<div class="v">'+val+'</div><div class="s '+si.sc+'">'+si.txt+'</div><div class="age">'+age+'</div></div>';
  }).join('');
  if(!curDetail)curDetail='orp';}
+// ---------- balance (slow lab-tested chemistry) ----------
+var BAL_ORDER=['cya','alk','ch','tc','cc','salt','br','po4'];
+var BAL_COLOR={cya:'#8b5cf6',alk:'#14b8a6',ch:'#a16207',tc:'#0ea5e9',cc:'#f43f5e',salt:'#0891b2',br:'#7c3aed',po4:'#65a30d'};
+function buildBalance(){var sec=document.getElementById('balanceSect');
+ var items=(LAB&&LAB.tests)?LAB.tests.filter(function(t){return t.key!=='fc';}):[];
+ if(!LAB||!LAB.configured||!items.length){sec.style.display='none';return;}
+ items.sort(function(a,b){return (BAL_ORDER.indexOf(a.key)+99)%100-(BAL_ORDER.indexOf(b.key)+99)%100;});
+ sec.style.display='block';
+ document.getElementById('balanceCard').innerHTML=items.map(function(t){var si=statusInfo(t.value,t.ideal_low,t.ideal_high);
+  return '<div class="grow" data-k="'+t.key+'" onclick="showDetail(this.dataset.k)" style="cursor:pointer">'
+   +'<span class="k" style="color:var(--text)">'+t.label+' <span class="s '+si.sc+'" style="font-size:11px;font-weight:700">'+si.txt+'</span></span>'
+   +'<span class="v">'+(t.value==null?'-':(+t.value).toFixed(t.dec))+' '+(t.unit||'')+' <small class="mut" style="font-weight:400">'+friendlyTime(t.ts)+'</small></span></div>';
+ }).join('');}
+function metricFor(k){var pr=metrics()[k];if(pr)return pr;var t=labTest(k);if(!t)return null;
+ return {title:t.label,color:(BAL_COLOR[k]||'var(--cl)'),val:t.value,unit:t.unit||'',dec:t.dec,lo:t.ideal_low,hi:t.ideal_high,live:false,ts:t.ts,src:'lab:'+k};}
 var curDetail=null, detailChart=null;
-function showDetail(k){curDetail=k;var m=metrics()[k];if(!m)return;
+function showDetail(k){curDetail=k;var m=metricFor(k);if(!m)return;
  document.querySelectorAll('.chip').forEach(function(c){c.classList.toggle('sel',c.dataset.k===k);});
  document.getElementById('detailCard').style.display='block';
  document.getElementById('dIcon').innerHTML=k==='temp'?THERMO:'<span style="display:inline-block;width:13px;height:13px;border-radius:50%;background:'+m.color+'"></span>';
@@ -1213,6 +1233,7 @@ function showDetail(k){curDetail=k;var m=metrics()[k];if(!m)return;
  document.getElementById('dUnit').innerHTML=m.unit?(' '+m.unit):'';
  var si=statusInfo(m.val,m.lo,m.hi);var ds=document.getElementById('dStatus');ds.textContent=si.txt;ds.style.color=scColor(si.sc);
  document.getElementById('dRange').textContent=(m.lo!=null&&m.hi!=null)?('target '+(+m.lo)+'-'+(+m.hi)+(m.unit?(' '+m.unit):'')):'';
+ if(k==='cl'){var cya=labTest('cya');if(cya&&cya.value!=null){var dr=document.getElementById('dRange');dr.textContent=(dr.textContent?dr.textContent+'  |  ':'')+'CYA '+(+cya.value).toFixed(0);}}
  document.getElementById('dAge').textContent=m.live?'live':(m.ts?('measured '+friendlyTime(m.ts)):'');
  var isLab=m.src.indexOf('lab:')===0;
  var url=isLab?('/api/lab-history?param='+m.src.slice(4)):('/api/history?days=7');
