@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "1.0.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "1.1.0"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -127,6 +127,21 @@ def init_db():
             baseline REAL,               -- odometer value at fit (seconds)
             factor REAL,                 -- litres per odometer-second at fit time
             size_l REAL)""")
+        # PoolLab / LabCom manual water tests (one row per measurement, deduped)
+        c.execute("""CREATE TABLE IF NOT EXISTS lab_tests (
+            meas_id TEXT PRIMARY KEY,    -- LabCom measurement unique id
+            ts TEXT,                     -- measurement timestamp (local ISO)
+            account_id TEXT,
+            parameter TEXT,              -- raw LabCom parameter, e.g. 'PL pH'
+            param_key TEXT,              -- normalized key, e.g. 'ph','fc','cya'
+            value REAL,
+            unit TEXT,
+            ideal_low REAL,
+            ideal_high REAL,
+            operator TEXT,
+            comment TEXT,
+            device_serial TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS ix_lab_param_ts ON lab_tests(param_key, ts)")
     # chlorine defaults
     if kv_get("bottle_l")         is None: kv_set("bottle_l", DEF_BOTTLE)
     if kv_get("poll_minutes")     is None: kv_set("poll_minutes", POLL_MINUTES)
@@ -147,6 +162,8 @@ def init_db():
     if kv_get("price_offpeak")    is None: kv_set("price_offpeak", 0.142)  # night / off-peak
     if kv_get("offpeak_window")   is None: kv_set("offpeak_window", "22:00-06:00")
     if kv_get("currency")         is None: kv_set("currency", "EUR")
+    # PoolLab / LabCom lab-test sync
+    if kv_get("labcom_poll_hours") is None: kv_set("labcom_poll_hours", 1.0)
     # one-time migration: fold the old single chlorine baseline into bottles[]
     _migrate_legacy_bottle()
 
@@ -259,7 +276,8 @@ def kv_set(k, v):
 # Config/secrets: a value edited in the web UI is stored in the DB (kv, on the
 # VM only) and takes priority over the environment variable of the same name.
 CFG_KEYS = ("KLEREO_LOGIN", "KLEREO_PASSWORD", "KLEREO_POOL_ID",
-            "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "ALERT_TO", "ALERT_FROM", "SMTP_PASS")
+            "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "ALERT_TO", "ALERT_FROM", "SMTP_PASS",
+            "LABCOM_TOKEN")
 
 
 def cfg_get(key):
@@ -574,6 +592,138 @@ def set_filtration(action):
     return None
 
 
+# --------------------------------------------------------------------------
+# PoolLab / LabCom cloud (manual water tests)  -- read-only GraphQL
+# --------------------------------------------------------------------------
+LABCOM_URL = "https://backend.labcom.cloud/graphql"
+LABCOM_QUERY = (
+    "query { CloudAccount { id email last_change_time "
+    "Accounts { id forename surname pooltext volume volume_unit "
+    "Measurements { id scenario parameter parameter_id unit value formatted_value "
+    "ideal_low ideal_high ideal_status timestamp operator_name comment device_serial "
+    "} } } }")
+
+# Map LabCom parameter names to a short key + display label + decimals.
+# Anything not listed still gets stored/shown, just under its raw name.
+LAB_PARAMS = {
+    "PL pH":             {"key": "ph",   "label": "pH",           "dec": 2},
+    "PL Chlorine Free":  {"key": "fc",   "label": "Free chlorine","dec": 2},
+    "PL Chlorine Total": {"key": "tc",   "label": "Total chlorine","dec": 2},
+    "PL Cyanuric Acid":  {"key": "cya",  "label": "Cyanuric acid (CYA)", "dec": 0},
+    "PL T-Alka":         {"key": "alk",  "label": "Total alkalinity",    "dec": 0},
+    "PL Calcium Hardness": {"key": "ch", "label": "Calcium hardness","dec": 0},
+    "PL Salt":           {"key": "salt", "label": "Salt",         "dec": 0},
+    "PL Bromine":        {"key": "br",   "label": "Bromine",      "dec": 2},
+    "PL Phosphate":      {"key": "po4",  "label": "Phosphate",    "dec": 2},
+}
+
+
+def _param_meta(parameter):
+    m = LAB_PARAMS.get(parameter)
+    if m:
+        return m["key"], m["label"], m["dec"]
+    # normalize an unknown parameter: strip "PL ", slug the key
+    label = re.sub(r"^PL\s+", "", parameter or "").strip() or (parameter or "?")
+    key = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "param"
+    return key, label, 2
+
+
+def _to_float(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ts_iso(v):
+    if isinstance(v, (int, float)):
+        return datetime.fromtimestamp(v).astimezone().isoformat(timespec="seconds")
+    return str(v) if v else None
+
+
+def labcom_fetch(token):
+    """POST the GraphQL query and return the CloudAccount dict (raises on error)."""
+    r = requests.post(LABCOM_URL, json={"query": LABCOM_QUERY},
+                      headers={"Authorization": token,
+                               "Content-Type": "application/json"},
+                      timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    b = r.json()
+    if b.get("errors"):
+        raise KlereoError("LabCom: " + json.dumps(b["errors"])[:200])
+    data = (b.get("data") or {}).get("CloudAccount")
+    if data is None:
+        raise KlereoError("LabCom: no CloudAccount in response")
+    return data
+
+
+def labcom_store(cloud):
+    """Insert any new measurements (dedup on measurement id). Returns count added."""
+    added = 0
+    with db() as c:
+        for acct in (cloud.get("Accounts") or []):
+            aid = acct.get("id")
+            for m in (acct.get("Measurements") or []):
+                mid = m.get("id")
+                if mid is None:
+                    continue
+                key, _label, _dec = _param_meta(m.get("parameter"))
+                cur = c.execute("INSERT OR IGNORE INTO lab_tests "
+                                "(meas_id,ts,account_id,parameter,param_key,value,unit,"
+                                " ideal_low,ideal_high,operator,comment,device_serial) "
+                                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                (str(mid), _ts_iso(m.get("timestamp")), str(aid),
+                                 m.get("parameter"), key, _to_float(m.get("value")),
+                                 m.get("unit"), _to_float(m.get("ideal_low")),
+                                 _to_float(m.get("ideal_high")), m.get("operator_name"),
+                                 m.get("comment"), m.get("device_serial")))
+                added += cur.rowcount
+    return added
+
+
+def labcom_poll_once(force=False):
+    """Fetch LabCom if a token is set and it's due (or forced). Stores new tests."""
+    token = _clean(cfg_get("LABCOM_TOKEN"))
+    if not token:
+        return None
+    cloud = labcom_fetch(token)
+    lct = cloud.get("last_change_time")
+    added = labcom_store(cloud)
+    # keep a trimmed copy of the newest tests for the /api/lab-raw diagnostics view
+    try:
+        sample = []
+        for acct in (cloud.get("Accounts") or [])[:2]:
+            ms = sorted((acct.get("Measurements") or []),
+                        key=lambda m: m.get("timestamp") or 0, reverse=True)[:12]
+            sample.append({"account_id": acct.get("id"),
+                           "pooltext": acct.get("pooltext"), "Measurements": ms})
+        kv_set("lab_last_raw", {"last_change_time": lct, "Accounts": sample})
+    except Exception:
+        pass
+    kv_set("lab_last_ok", now_iso())
+    kv_set("lab_last_error", None)
+    kv_set("lab_last_change", lct)
+    if cloud.get("Accounts"):
+        a0 = cloud["Accounts"][0]
+        kv_set("lab_pool_name", a0.get("pooltext") or
+               (f"{a0.get('forename','')} {a0.get('surname','')}").strip())
+    return added
+
+
+def _labcom_due():
+    """True if enough time has passed since the last successful LabCom fetch."""
+    last = kv_get("lab_last_ok")
+    if not last:
+        return True
+    try:
+        hrs = float(kv_get("labcom_poll_hours", 1.0))
+        age = (datetime.now(timezone.utc).astimezone()
+               - datetime.fromisoformat(last)).total_seconds()
+        return age >= hrs * 3600
+    except Exception:
+        return True
+
+
 def poller_loop():
     while True:
         try:
@@ -584,6 +734,15 @@ def poller_loop():
         except Exception as e:
             print("[poll] error:", e)
             kv_set("last_error", f"{now_iso()}: {e}")
+        # LabCom lab tests change rarely; fetch on its own slower cadence.
+        try:
+            if cfg_get("LABCOM_TOKEN") and _labcom_due():
+                n = labcom_poll_once()
+                if n:
+                    print(f"[labcom] {n} new lab test(s) stored")
+        except Exception as e:
+            print("[labcom] error:", e)
+            kv_set("lab_last_error", f"{now_iso()}: {e}")
         try:
             mins = float(kv_get("poll_minutes", POLL_MINUTES))
         except (TypeError, ValueError):
@@ -738,6 +897,17 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
    </div>
   </div>
  </div>
+ <div id="labSection" style="display:none">
+  <div class="sect">Lab tests (PoolLab) <span id="labwhen" style="text-transform:none;letter-spacing:0;font-weight:400;color:#64748b"></span></div>
+  <div id="labGrid" class="grid"></div>
+  <div class="panel" id="labChartPanel" style="display:none">
+   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
+     <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">Lab history</div>
+     <div class="seg" id="labParamSeg"></div>
+   </div>
+   <div style="position:relative;height:200px"><canvas id="labChart"></canvas></div>
+  </div>
+ </div>
  <div class="panel">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
     <div class="lbl" style="color:#94a3b8;font-size:12px;text-transform:uppercase">pH &amp; Redox</div>
@@ -825,6 +995,55 @@ async function load(){
  loadUsage();
  filterCfg={pump:(s.pump_kw||0.9), price:(s.price_kwh||0.182), priceOff:(s.price_offpeak||s.price_kwh||0.142), cur:(s.currency||'')};
  loadFilter();
+ loadLab();
+}
+let labParam=null, labChart, labTests=[];
+async function loadLab(){
+ let s={};
+ try{ s=await (await fetch('/api/lab-latest')).json(); }catch(e){ s={}; }
+ const sec=document.getElementById('labSection');
+ labTests=s.tests||[];
+ if(!s.configured || !labTests.length){ sec.style.display='none'; return; }
+ sec.style.display='block';
+ document.getElementById('labwhen').textContent = s.last_ok? ('- updated '+relTime(s.last_ok)) : '';
+ const grid=document.getElementById('labGrid');
+ grid.innerHTML=labTests.map(labTile).join('');
+ // parameter buttons for the history chart
+ const seg=document.getElementById('labParamSeg');
+ if(labParam===null && labTests.length) labParam=labTests[0].key;
+ seg.innerHTML=labTests.map(t=>'<button type="button" class="'+(t.key===labParam?'active':'')+'" data-key="'+t.key+'" onclick="setLabParam(this.dataset.key)">'+t.label+'</button>').join('');
+ document.getElementById('labChartPanel').style.display = labTests.length? 'block':'none';
+ drawLabChart();
+}
+function labTile(t){
+ const z=zone(t.value, t.ideal_low, t.ideal_high);
+ const val=(t.value==null?'-':(+t.value).toFixed(t.dec));
+ const rng=(t.ideal_low!=null&&t.ideal_high!=null)? ('ideal '+t.ideal_low+'-'+t.ideal_high+(t.unit?(' '+t.unit):'')) : (t.unit||'');
+ return '<div class="card"><div class="lbl">'+t.label+'</div>'
+   +'<div class="val '+z+'">'+val+'</div>'
+   +'<div class="unit">'+rng+'</div>'
+   +'<div class="sub" style="margin-top:4px;font-size:11px">'+relTime(t.ts)+'</div></div>';
+}
+function setLabParam(k){ labParam=k;
+ document.querySelectorAll('#labParamSeg button').forEach(b=>b.classList.toggle('active', b.dataset.key===k));
+ drawLabChart();
+}
+async function drawLabChart(){
+ if(!labParam) return;
+ let h=[];
+ try{ h=await (await fetch('/api/lab-history?param='+encodeURIComponent(labParam))).json(); }catch(e){}
+ const t=labTests.find(x=>x.key===labParam)||{};
+ const fmt=x=>{const d=new Date(x.ts); return isNaN(d)? x.ts : d.toLocaleDateString([], {day:'numeric',month:'short'}); };
+ const ds=[{label:t.label||labParam, data:h.map(x=>x.value), borderColor:'#34d399', backgroundColor:'#34d399', borderWidth:2, tension:.25, pointRadius:3}];
+ const lo=h.length?h[h.length-1].ideal_low:null, hi=h.length?h[h.length-1].ideal_high:null;
+ if(lo!=null) ds.push({label:'ideal low', data:h.map(()=>lo), borderColor:'#64748b', borderDash:[5,4], borderWidth:1, pointRadius:0});
+ if(hi!=null) ds.push({label:'ideal high', data:h.map(()=>hi), borderColor:'#64748b', borderDash:[5,4], borderWidth:1, pointRadius:0});
+ const data={labels:h.map(fmt), datasets:ds};
+ const opts={responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}},
+   scales:{y:{grid:{color:'#334155'},ticks:{color:'#cbd5e1'}},
+           x:{ticks:{maxTicksLimit:8,color:'#94a3b8'},grid:{display:false}}}};
+ if(labChart) labChart.destroy();
+ labChart=new Chart(document.getElementById('labChart'),{type:'line',data,options:opts});
 }
 function relTime(iso){
  if(!iso) return 'never';
@@ -1141,6 +1360,7 @@ def config_html():
     ph_warn   = kv_get("ph_warn_remaining_l", 5.0)
     ph_final  = kv_get("ph_final_remaining_l", 0.5)
     ph_pump   = kv_get("ph_pump_lph", 1.5)
+    labhrs = kv_get("labcom_poll_hours", 1.0)
     poll   = kv_get("poll_minutes", POLL_MINUTES)
     gpl    = kv_get("liquid_cl_gpl", 48.0)
     pump   = kv_get("pump_kw", 0.9)
@@ -1217,6 +1437,15 @@ a{color:#93c5fd}
  <div class="hint">Gmail app password (16 chars). Leave blank to keep the current one.</div>
  <button class="ghost" type="button" onclick="testEmail()">Send test email</button>
 </div>
+<div class="panel"><div class="lbl2">PoolLab / LabCom (lab tests)</div>
+ <div class="setrow"><label>API token</label><input id="LABCOM_TOKEN" type="password" placeholder="unchanged" autocomplete="off"></div>
+ <div class="setrow"><label>Sync every</label><span><input id="labcom_poll_hours" type="number" step="0.5" min="0.5" value="{labhrs}"><span class="u">h</span></span></div>
+ <div class="hint">Get a read-only token at <a href="https://labcom.cloud/pages/user-setting" target="_blank">labcom.cloud &rarr; user settings</a>. Your PoolLab must sync to the LabCom cloud. Manual tests are pulled in and shown on the dashboard.</div>
+ <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
+   <button class="ghost" type="button" onclick="labSync()">Sync now</button>
+   <a href="/api/lab-raw" target="_blank" style="align-self:center">View raw lab data</a>
+ </div>
+</div>
 <div class="panel"><div class="lbl2">Filtration control (test)</div>
  <div class="hint" style="margin-top:0">Drive the pump directly. Start/Stop force it into manual; Regulated hands control back to Klereo. Each takes a few seconds.</div>
  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
@@ -1246,9 +1475,10 @@ async function postAction(url, body){
  try{ const r=await fetch(url,opt); return await r.json(); }catch(e){ return {ok:false,message:'Network error'}; }
 }
 async function testEmail(){ showToast('Sending test email...'); const r=await postAction('/test-email'); showToast(r.message, r.ok); }
+async function labSync(){ showToast('Syncing PoolLab...'); const r=await postAction('/lab-refresh'); showToast(r.message, r.ok); }
 async function filterCtl(a){ showToast('Sending filtration command...'); const r=await postAction('/api/filter-control','action='+a); showToast(r.message, r.ok); }
 async function saveConfig(){
- const ids=['bottle_l','warn','final','ph_bottle_l','ph_warn','ph_final','ph_pump_lph','poll','gpl','pump','price','price_off','offwin','currency','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS'];
+ const ids=['bottle_l','warn','final','ph_bottle_l','ph_warn','ph_final','ph_pump_lph','labcom_poll_hours','poll','gpl','pump','price','price_off','offwin','currency','KLEREO_LOGIN','KLEREO_POOL_ID','KLEREO_PASSWORD','SMTP_HOST','SMTP_PORT','SMTP_USER','ALERT_TO','SMTP_PASS','LABCOM_TOKEN'];
  const p=new URLSearchParams();
  ids.forEach(id=>{const el=document.getElementById(id); if(el && el.value!=='') p.append(id, el.value);});
  const r=await postAction('/config', p.toString()); showToast(r.message, r.ok);
@@ -1289,6 +1519,43 @@ def status_payload():
         "offpeak_window": kv_get("offpeak_window", "22:00-06:00"),
         "currency": kv_get("currency", "EUR"),
     }
+
+
+def lab_latest_payload():
+    """Latest lab measurement per parameter + connection status."""
+    with db() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT t.* FROM lab_tests t JOIN "
+            "(SELECT param_key, MAX(ts) AS mx FROM lab_tests GROUP BY param_key) g "
+            "ON t.param_key=g.param_key AND t.ts=g.mx ORDER BY t.parameter").fetchall()]
+    order = {k: i for i, k in enumerate(
+        ["ph", "fc", "tc", "cya", "alk", "ch", "salt", "br", "po4"])}
+    tests = []
+    for r in rows:
+        _key, label, dec = _param_meta(r["parameter"])
+        tests.append({"key": r["param_key"], "parameter": r["parameter"], "label": label,
+                      "dec": dec, "value": r["value"], "unit": r["unit"],
+                      "ideal_low": r["ideal_low"], "ideal_high": r["ideal_high"],
+                      "ts": r["ts"], "operator": r["operator"], "comment": r["comment"]})
+    tests.sort(key=lambda t: order.get(t["key"], 99))
+    return {"tests": tests, "configured": bool(cfg_get("LABCOM_TOKEN")),
+            "last_ok": kv_get("lab_last_ok"), "last_error": kv_get("lab_last_error"),
+            "pool_name": kv_get("lab_pool_name"),
+            "poll_hours": kv_get("labcom_poll_hours", 1.0)}
+
+
+def lab_history_payload(param_key, days=730):
+    from datetime import timedelta
+    cutoff = (datetime.now(timezone.utc).astimezone() - timedelta(days=days)).isoformat()
+    with db() as c:
+        rows = c.execute("SELECT ts,value,ideal_low,ideal_high FROM lab_tests "
+                         "WHERE param_key=? AND ts>=? AND value IS NOT NULL ORDER BY ts",
+                         (param_key, cutoff)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def lab_raw_payload():
+    return kv_get("lab_last_raw") or {}
 
 
 def history_payload(days=1):
@@ -1631,6 +1898,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(bottle_history(chem if chem in CHEM else "cl"))
         elif path == "/api/filter-usage":
             self._json(filter_usage_payload())
+        elif path == "/api/lab-latest":
+            self._json(lab_latest_payload())
+        elif path == "/api/lab-history":
+            q = parse_qs(urlparse(self.path).query)
+            self._json(lab_history_payload(q.get("param", ["ph"])[0]))
+        elif path == "/api/lab-raw":
+            self._json(lab_raw_payload())
         elif path == "/api/raw":
             self._json(raw_payload())
         elif path == "/api/cover-latest.jpg":
@@ -1705,6 +1979,7 @@ class Handler(BaseHTTPRequestHandler):
                 if form.get("ph_warn"): kv_set("ph_warn_remaining_l", max(0.0, float(form["ph_warn"])))
                 if form.get("ph_final"): kv_set("ph_final_remaining_l", max(0.0, float(form["ph_final"])))
                 if form.get("ph_pump_lph"): kv_set("ph_pump_lph", max(0.0, float(form["ph_pump_lph"])))
+                if form.get("labcom_poll_hours"): kv_set("labcom_poll_hours", max(0.5, float(form["labcom_poll_hours"])))
                 if form.get("poll"): kv_set("poll_minutes", max(1.0, float(form["poll"])))
                 if form.get("gpl"): kv_set("liquid_cl_gpl", max(1.0, float(form["gpl"])))
                 if form.get("pump"): kv_set("pump_kw", max(0.0, float(form["pump"])))
@@ -1720,6 +1995,19 @@ class Handler(BaseHTTPRequestHandler):
                 with _lock:
                     poll_once()
                 self._json({"ok": True, "message": "Updated from the controller."})
+            elif path == "/lab-refresh":
+                try:
+                    n = labcom_poll_once(force=True)
+                    if n is None:
+                        msg = "No LabCom token set (add it in Settings)."
+                        ok = False
+                    else:
+                        msg = f"LabCom synced - {n} new test(s)." if n else "LabCom synced - no new tests."
+                        ok = True
+                    self._json({"ok": ok, "message": msg})
+                except Exception as e:
+                    kv_set("lab_last_error", f"{now_iso()}: {e}")
+                    self._json({"ok": False, "message": f"LabCom sync failed: {e}"})
             elif path == "/api/filter-control":
                 action = form.get("action", "")
                 try:
