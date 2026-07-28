@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.2.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.3.1"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -936,9 +936,9 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,san
 .wq{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
 .chip{background:var(--card2);border-radius:14px;padding:10px 3px 11px;text-align:center;cursor:pointer;border:2px solid transparent;transition:border-color .15s}
 .chip.sel{border-color:var(--primary)}
-.gaugewrap{text-align:center;line-height:0}
+.gaugewrap{text-align:center;line-height:0;margin-bottom:6px}
 .gaugewrap svg{display:inline-block;width:100%;max-width:92px}
-.gval{font-size:19px;font-weight:800;letter-spacing:-.5px;margin-top:-8px}
+.gval{font-size:19px;font-weight:800;letter-spacing:-.5px;margin-top:2px}
 .gval small{font-size:10px;color:var(--muted);font-weight:600;margin-left:1px}
 .gname{font-size:12px;font-weight:700;margin-top:2px}
 .chip .dot{width:38px;height:38px;border-radius:50%;margin:0 auto 7px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px}
@@ -1000,6 +1000,20 @@ input{background:var(--card2);border:1px solid var(--line);color:var(--text);bor
 .err{background:var(--badbg);color:var(--bad);padding:9px 12px;border-radius:10px;font-size:13px;margin:8px 0}
 a{color:var(--primary)}
 .liquid{transition:transform 1.2s cubic-bezier(.25,.9,.3,1)}
+/* ---- responsive: widen + multi-column on tablet/desktop (mobile unchanged) ---- */
+@media (min-width:800px){
+ .app{max-width:1080px;padding-bottom:104px}
+ .top{padding:22px 22px 6px}
+ .wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:14px;align-items:start;padding:8px 20px}
+ .wrap>.card{margin-bottom:0}
+ .wrap>.sect{grid-column:1/-1;margin:12px 4px 0}
+ .wrap>.span,.wrap>.bottles,.wrap>#alertsBody,.wrap>#balanceSect{grid-column:1/-1}
+ .wrap>.bottles{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+ #balanceSect .card,#balanceSect{margin-bottom:0}
+ #errbox{max-width:1080px;margin:0 auto}
+ .tabbar{max-width:660px;border-radius:16px 16px 0 0}
+ .gaugewrap svg{max-width:120px}
+}
 </style></head><body>
 <div id="toast" class="toast"></div>
 <div id="ptr" style="position:fixed;top:0;left:0;right:0;text-align:center;padding:8px;color:var(--muted);font-size:13px;transform:translateY(-40px);transition:transform .15s;z-index:6">&#8595; pull to refresh</div>
@@ -1041,13 +1055,13 @@ a{color:var(--primary)}
 
  <!-- DASHBOARD -->
  <div class="page active" id="p-dash"><div class="wrap">
-   <div class="card">
+   <div class="card span" id="wqCard">
      <div class="cardhead"><div class="t">
        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2s6 6.5 6 11a6 6 0 0 1-12 0c0-4.5 6-11 6-11z"/></svg>
        Water quality</div><span class="mut" style="font-size:12px">tap a metric</span></div>
      <div class="wq" id="wq"></div>
    </div>
-   <div class="card" id="detailCard" style="display:none">
+   <div class="card span" id="detailCard" style="display:none">
      <div class="cardhead"><div class="t"><span id="dIcon"></span><span id="dTitle"></span></div><span class="mut" id="dAge"></span></div>
      <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:8px">
        <div class="big"><span id="dVal">-</span><small id="dUnit"></small></div>
@@ -1115,7 +1129,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.2.0</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.3.1</div>
  </div></div>
 
  <div class="tabbar">
