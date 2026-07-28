@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.0.1"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.0.2"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -1103,7 +1103,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.0.1</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.0.2</div>
  </div></div>
 
  <div class="tabbar">
@@ -1137,6 +1137,8 @@ function statusInfo(v,lo,hi){if(v==null||lo==null||hi==null)return {sc:'',txt:'-
  var m=(hi-lo)*0.12;if(v<=lo+m)return {sc:'warn',txt:'Low'};if(v>=hi-m)return {sc:'warn',txt:'High'};
  return {sc:'ok',txt:'Ideal'};}
 function scColor(sc){return sc==='bad'?'var(--bad)':(sc==='warn'?'var(--warn)':'var(--ok)');}
+function cssVar(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+function resolveColor(c){if(c&&c.indexOf('var(')===0){return cssVar(c.slice(4,-1).trim())||c;}return c;}
 function fmtDate(iso){var d=new Date((''+iso).length<=10?iso+'T00:00:00':iso);if(isNaN(d))return iso;return d.toLocaleDateString([],{day:'numeric',month:'short'});}
 function friendlyTime(iso){if(!iso)return 'never';var d=new Date(iso);if(isNaN(d))return iso;var now=new Date(),s=(now-d)/1000;var hm=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
  if(s<60)return 'just now';if(s<3600){var m=Math.floor(s/60);return m+' minute'+(m===1?'':'s')+' ago';}
@@ -1228,7 +1230,8 @@ function drawDetailChart(series,color,unit,lo,hi,isLab){
  var labels=series.map(function(x){var d=new Date(x.t);if(isNaN(d))return x.t;
    return isLab? d.toLocaleDateString([],{day:'numeric',month:'short'})
               : d.toLocaleString([],{hour:'2-digit',minute:'2-digit',day:'numeric',month:'short'});});
- var ds=[{label:unit||'value',data:series.map(function(x){return x.v;}),borderColor:color,backgroundColor:color,borderWidth:2,tension:.25,pointRadius:isLab?3:0,fill:false}];
+ var col=resolveColor(color);
+ var ds=[{label:unit||'value',data:series.map(function(x){return x.v;}),borderColor:col,backgroundColor:col,borderWidth:2.5,tension:.25,pointRadius:isLab?3:0,fill:false}];
  if(lo!=null)ds.push({label:'min',data:series.map(function(){return lo;}),borderColor:tc,borderDash:[5,4],borderWidth:1,pointRadius:0});
  if(hi!=null)ds.push({label:'max',data:series.map(function(){return hi;}),borderColor:tc,borderDash:[5,4],borderWidth:1,pointRadius:0});
  var opts={responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
