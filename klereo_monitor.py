@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.6.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.7.0"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -164,6 +164,11 @@ def init_db():
     if kv_get("currency")         is None: kv_set("currency", "EUR")
     # bottle forecast: days of history to average consumption over
     if kv_get("bottle_avg_days") is None: kv_set("bottle_avg_days", 14)
+    # current-weather widget (Open-Meteo, no API key). Default: pool location.
+    if kv_get("weather_enabled") is None: kv_set("weather_enabled", 1)
+    if kv_get("weather_lat")     is None: kv_set("weather_lat", 45.942)
+    if kv_get("weather_lon")     is None: kv_set("weather_lon", 0.479)
+    if kv_get("weather_place")   is None: kv_set("weather_place", "Saint-Laurent-de-Ceris")
     # PoolLab / LabCom lab-test sync
     if kv_get("labcom_poll_hours") is None: kv_set("labcom_poll_hours", 1.0)
     # re-key any lab rows stored before a parameter was added to LAB_PARAMS
@@ -837,6 +842,44 @@ def _labcom_due():
         return True
 
 
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+def _weather_due():
+    last = kv_get("weather_ts")
+    if not last:
+        return True
+    try:
+        age = (datetime.now(timezone.utc).astimezone()
+               - datetime.fromisoformat(last)).total_seconds()
+    except Exception:
+        return True
+    return age >= 1800.0          # refresh at most every 30 minutes
+
+
+def weather_poll_once(force=False):
+    """Fetch current conditions from Open-Meteo (free, no key) and cache them."""
+    if not kv_get("weather_enabled", 1):
+        return None
+    if not force and not _weather_due():
+        return None
+    lat, lon = kv_get("weather_lat"), kv_get("weather_lon")
+    if lat is None or lon is None:
+        return None
+    resp = requests.get(WEATHER_URL, params={
+        "latitude": lat, "longitude": lon,
+        "current": "temperature_2m,weather_code,is_day",
+        "timezone": "auto"}, timeout=10)
+    resp.raise_for_status()
+    cur = (resp.json() or {}).get("current") or {}
+    w = {"temp": cur.get("temperature_2m"),
+         "code": cur.get("weather_code"),
+         "is_day": cur.get("is_day"),
+         "ts": now_iso()}
+    kv_set("weather", w)
+    kv_set("weather_ts", now_iso())
+    return w
+
+
 def poller_loop():
     while True:
         try:
@@ -856,6 +899,10 @@ def poller_loop():
         except Exception as e:
             print("[labcom] error:", e)
             kv_set("lab_last_error", f"{now_iso()}: {e}")
+        try:
+            weather_poll_once()
+        except Exception as e:
+            print("[weather] error:", e)
         try:
             mins = float(kv_get("poll_minutes", POLL_MINUTES))
         except (TypeError, ValueError):
@@ -927,6 +974,9 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,san
 .top h1{font-size:21px;margin:0;letter-spacing:-.3px}
 .top .sub{color:var(--muted);font-size:12.5px;margin-top:2px}
 .iconbtn{width:38px;height:38px;border-radius:12px;border:0;background:var(--card);box-shadow:var(--shadow);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer}
+.weather{display:flex;align-items:center;gap:5px;font-size:15px;font-weight:700;color:var(--text)}
+.weather svg{color:var(--orp)}
+.weather:empty{display:none}
 .wrap{padding:6px 15px}
 .sect{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin:16px 4px 9px}
 .card{background:var(--card);border-radius:18px;box-shadow:var(--shadow);padding:16px;margin-bottom:12px}
@@ -989,6 +1039,12 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,san
 .ln1 .v{font-weight:700;font-size:15px;text-align:right;white-space:nowrap}
 .ln2{display:flex;justify-content:space-between;gap:12px;align-items:baseline;margin-top:2px;font-size:12px}
 .ln2 .s{font-weight:700}
+.darow{display:flex;gap:9px;align-items:flex-start;padding:9px 2px;border-top:1px solid var(--line)}
+.darow:first-child{border-top:0}
+.dadot{width:8px;height:8px;border-radius:50%;margin-top:5px;flex:0 0 auto}
+.dadot.bad{background:var(--bad)} .dadot.warn{background:var(--warn)} .dadot.info{background:var(--primary)}
+.dat{font-size:13px;font-weight:600}
+.dad{font-size:11.5px;color:var(--muted);margin-top:1px}
 .alert{display:flex;gap:12px;align-items:flex-start;padding:14px;border-radius:15px;margin-bottom:10px;background:var(--card);box-shadow:var(--shadow)}
 .alert .ai{width:36px;height:36px;border-radius:11px;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
 .ai.bad{background:var(--badbg);color:var(--bad)} .ai.warn{background:var(--warnbg);color:var(--warn)} .ai.info{background:var(--primarybg);color:var(--primary)}
@@ -1016,10 +1072,10 @@ a{color:var(--primary)}
  .wrap{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start;padding:8px 20px}
  .wrap>.card{margin-bottom:0}
  .wrap>.sect{grid-column:1/-1;margin:12px 4px 0}
- .wrap>.span,.wrap>.bottles,.wrap>#alertsBody,.wrap>#wqCard{grid-column:1/-1}
+ .wrap>.span,.wrap>.bottles,.wrap>#alertsBody,.wrap>#wqCard,.wrap>.mut{grid-column:1/-1}
  .wrap>.bottles{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
- /* row 2: metric chart + balance share the row at matching height */
- #detailCard,#balanceSect{align-self:stretch}
+ /* rows share height for a uniform grid */
+ #detailCard,#balanceSect,#filtCard,#dashAlerts{align-self:stretch}
  #balanceSect{display:flex;flex-direction:column;margin-bottom:0}
  #balanceCard{flex:1;display:flex;flex-direction:column;justify-content:center;margin-bottom:0}
  #errbox{max-width:1080px;margin:0 auto}
@@ -1061,7 +1117,9 @@ a{color:var(--primary)}
  <div class="top">
    <div><h1>Pool Stats <span id="nick" style="font-size:14px;color:var(--muted);font-weight:400"></span></h1>
      <div class="sub" id="sub">loading...</div></div>
-   <button class="iconbtn" id="themeBtn" onclick="cycleTheme()" title="Theme"></button>
+   <div style="display:flex;align-items:center;gap:12px">
+     <div class="weather" id="weather"></div>
+     <button class="iconbtn" id="themeBtn" onclick="cycleTheme()" title="Theme"></button></div>
  </div>
  <div id="errbox"></div>
 
@@ -1091,15 +1149,19 @@ a{color:var(--primary)}
    <div class="sect">Bottles</div>
    <div class="bottles" id="bottles"></div>
 
-   <div class="sect">Filtration</div>
-   <div class="card">
-     <div class="cardhead"><div class="t"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg><span id="filtState">Filtration</span></div><span class="mut" id="filtToday"></span></div>
+   <div class="sect">Filtration &amp; alerts</div>
+   <div class="card" id="filtCard">
+     <div class="cardhead"><div class="t"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg>Filtration</div><span class="mut" id="filtState"></span></div>
      <div class="mut" style="font-size:12px;margin-bottom:8px">Daily runtime (last 10 days)</div>
-     <div class="chartbox" id="chartFilt"></div>
+     <div style="position:relative;height:150px"><canvas id="chartFilt"></canvas></div>
      <div style="display:flex;gap:14px;justify-content:flex-end;font-size:11px;color:var(--muted);margin:8px 2px 0">
        <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--primary);margin-right:4px"></span>off-peak</span>
        <span><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--orp);margin-right:4px"></span>peak</span></div>
      <div class="grow" id="filtSummary"><span class="k">Last 7 days</span><span class="v">-</span></div>
+   </div>
+   <div class="card" id="dashAlerts">
+     <div class="cardhead"><div class="t"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9z"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>Alerts</div><a onclick="go('alerts')" style="cursor:pointer;font-size:12px">View all &rarr;</a></div>
+     <div id="dashAlertsBody"></div>
    </div>
  </div></div>
 
@@ -1141,7 +1203,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.6.0</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.7.0</div>
  </div></div>
 
  <div class="tabbar">
@@ -1164,6 +1226,28 @@ function applyTheme(){document.documentElement.setAttribute('data-theme',eff());
  document.getElementById('themeBtn').innerHTML=mode==='auto'?auto:(eff()==='dark'?moon:sun);}
 function cycleTheme(){mode=mode==='auto'?'light':(mode==='light'?'dark':'auto');localStorage.setItem('themeMode',mode);applyTheme();}
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change',applyTheme); applyTheme();
+// ---------- weather ----------
+function wIcon(t){var s='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">';
+ var g={sun:'<circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5 3.6 3.6M20.4 20.4 19 19M19 5l1.4-1.4M3.6 20.4 5 19"/>',
+  pcloud:'<circle cx="8" cy="8" r="3"/><path d="M8 2v1M2 8h1M4 4l.7.7M12 4l-.7.7"/><path d="M17.5 20H7a4 4 0 0 1 0-8 5 5 0 0 1 9.6 1.3A3.5 3.5 0 0 1 17.5 20z"/>',
+  cloud:'<path d="M17.5 18H7a4 4 0 0 1 0-8 5 5 0 0 1 9.6 1.3A3.5 3.5 0 0 1 17.5 18z"/>',
+  fog:'<path d="M17.5 14H7a4 4 0 0 1 0-8 5 5 0 0 1 9.6 1.3A3.5 3.5 0 0 1 17.5 14z"/><path d="M5 18h14M7 21h10"/>',
+  rain:'<path d="M17.5 13H7a4 4 0 0 1 0-8 5 5 0 0 1 9.6 1.3A3.5 3.5 0 0 1 17.5 13z"/><path d="M8 17l-1 3M12 17l-1 3M16 17l-1 3"/>',
+  snow:'<path d="M17.5 13H7a4 4 0 0 1 0-8 5 5 0 0 1 9.6 1.3A3.5 3.5 0 0 1 17.5 13z"/><path d="M8 18h.01M12 18h.01M16 18h.01M10 21h.01M14 21h.01"/>',
+  storm:'<path d="M17.5 12H7a4 4 0 0 1 0-8 5 5 0 0 1 9.6 1.3A3.5 3.5 0 0 1 17.5 12z"/><path d="M13 12l-3 5h3l-2 4"/>'};
+ return s+(g[t]||g.cloud)+'</svg>';}
+function wmo(code){var m={0:['sun','Clear'],1:['sun','Mainly clear'],2:['pcloud','Partly cloudy'],3:['cloud','Overcast'],
+ 45:['fog','Fog'],48:['fog','Rime fog'],51:['rain','Light drizzle'],53:['rain','Drizzle'],55:['rain','Heavy drizzle'],
+ 56:['rain','Freezing drizzle'],57:['rain','Freezing drizzle'],61:['rain','Light rain'],63:['rain','Rain'],65:['rain','Heavy rain'],
+ 66:['rain','Freezing rain'],67:['rain','Freezing rain'],71:['snow','Light snow'],73:['snow','Snow'],75:['snow','Heavy snow'],
+ 77:['snow','Snow grains'],80:['rain','Showers'],81:['rain','Showers'],82:['rain','Heavy showers'],
+ 85:['snow','Snow showers'],86:['snow','Snow showers'],95:['storm','Thunderstorm'],96:['storm','Thunderstorm'],99:['storm','Thunderstorm']};
+ return m[code]||['cloud','--'];}
+function renderWeather(w,place){var el=document.getElementById('weather');if(!el)return;
+ if(!w||w.temp==null){el.innerHTML='';el.title='';return;}
+ var wi=wmo(w.code);
+ el.innerHTML=wIcon(wi[0])+'<span>'+Math.round(w.temp)+'&deg;</span>';
+ el.title=wi[1]+(place?(' at '+place):'');}
 function go(p){document.querySelectorAll('.page').forEach(function(x){x.classList.remove('active')});
  document.getElementById('p-'+p).classList.add('active');
  document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('active',t.dataset.p===p)});window.scrollTo(0,0);}
@@ -1224,7 +1308,8 @@ function render(){
  document.getElementById('nick').textContent=r.nickname||'';
  document.getElementById('sub').textContent='Updated '+friendlyTime(S.last_ok)+'  |  every '+S.poll_minutes+' min';
  document.getElementById('errbox').innerHTML=S.last_error?('<div class="wrap"><div class="err">Last error: '+S.last_error+'</div></div>'):'';
- buildWQ(); buildBalance(); buildBottles(); buildFilt(); buildLabList(); buildAlerts();
+ renderWeather(S.weather,S.weather_place);
+ buildWQ(); buildBalance(); buildBottles(); buildFilt(); buildLabList(); buildAlerts(); buildDashAlerts();
  if(curDetail)showDetail(curDetail);
  animateLiquid();
  drawPhOrp(); loadUsage(); loadCorr();
@@ -1312,7 +1397,7 @@ function bottleCard(chem,fc,warn,fin){var meta=CHEM[chem];var has=fc&&fc.remaini
  var svg='<div>'+bottle(pct,meta.c1,meta.c2,(fc&&fc.size?fc.size:20)+' L',((fc&&fc.size?fc.size:20)/2)+' L')+'</div>';
  var days=(has&&fc.days_left!=null)?('<div class="row2" style="color:var(--ok)">&asymp; '+Math.round(fc.days_left)+' days left</div><div class="mut" style="font-size:12px">Est. empty: '+(fc.est_empty?fmtDate(fc.est_empty):'-')+'</div>')
    :'<div class="row2" style="color:var(--primary)">Estimate unavailable</div><div class="mut" style="font-size:12px">'+(has?'building forecast':'no baseline yet')+'</div>';
- var ut=(has&&fc.used_today!=null)?(fc.used_today<0.1?((fc.used_today*1000).toFixed(0)+' mL'):(fc.used_today.toFixed(2)+' L')):'-';
+ var ut=(has&&fc.used_today!=null)?(fc.used_today<1?((fc.used_today*1000).toFixed(0)+' mL'):(fc.used_today.toFixed(2)+' L')):'-';
  var av=(has&&fc.avg_per_day!=null)?(fc.avg_per_day.toFixed(2)+' L/day'):'-';
  var rem=has?fc.remaining.toFixed(1):'--';
  return '<div class="card"><div class="bottle">'+svg+'<div class="info">'
@@ -1328,19 +1413,32 @@ function buildBottles(){document.getElementById('bottles').innerHTML=
   bottleCard('ph',S.ph_forecast,S.ph_warn_remaining_l,S.ph_final_remaining_l);}
 
 // ---------- filtration ----------
-var filtData=[];
+var filtData=[],filtChart=null;
 function buildFilt(){var r=S.reading||{};
- document.getElementById('filtState').textContent=r.filtration==null?'Filtration':(r.filtration?('Running '+(r.filt_mode!=null?('- '+modeName(r.filt_mode)):'')):'Off');
+ document.getElementById('filtState').textContent=r.filtration==null?'':(r.filtration?('Running'+(r.filt_mode!=null?(' - '+modeName(r.filt_mode)):'')):'Off');
  fetch('/api/filter-usage').then(function(x){return x.json();}).then(function(d){filtData=d||[];drawFilt();}).catch(function(){filtData=[];drawFilt();});}
-function drawFilt(){var box=document.getElementById('chartFilt');var days=filtData.slice(-10);
- if(!days.length){box.innerHTML='<div class="mut" style="font-size:12px">builds up as it runs</div>';document.getElementById('filtSummary').innerHTML='<span class="k">Last 7 days</span><span class="v">-</span>';return;}
- var maxH=Math.max.apply(null,days.map(function(d){return d.hours||0;}))||1;
- box.innerHTML=days.map(function(d){var pk=(d.peak_hours||0)/maxH*100,of=(d.offpeak_hours||0)/maxH*100;
-  return '<div style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%"><div style="height:'+pk+'%;background:var(--orp);border-radius:5px 5px 0 0"></div><div style="height:'+of+'%;background:var(--primary);border-radius:0 0 3px 3px"></div></div>';}).join('');
- var last7=filtData.slice(-7);var pk=last7.reduce(function(s,d){return s+(d.peak_hours||0);},0),of=last7.reduce(function(s,d){return s+(d.offpeak_hours||0);},0);
- var kw=S.pump_kw||0.9;var cost=pk*kw*(S.price_kwh||0.182)+of*kw*(S.price_offpeak||0.142);
- document.getElementById('filtSummary').innerHTML='<span class="k">Last 7 days</span><span class="v">'+(pk+of).toFixed(1)+' h &middot; '+(S.currency||'')+cost.toFixed(2)+'</span>';
- document.getElementById('filtToday').textContent='';}
+function drawFilt(){var days=filtData.slice(-10);var cv=document.getElementById('chartFilt');
+ var kw=S.pump_kw||0.9,pk=S.price_kwh||0.182,op=S.price_offpeak||0.142,cur=S.currency||'';
+ if(filtChart){filtChart.destroy();filtChart=null;}
+ if(!days.length){var ctx=cv.getContext('2d');ctx.clearRect(0,0,cv.width,cv.height);document.getElementById('filtSummary').innerHTML='<span class="k">Last 7 days</span><span class="v">-</span>';return;}
+ var tc=getComputedStyle(document.documentElement).getPropertyValue('--muted');var gc=getComputedStyle(document.documentElement).getPropertyValue('--line');
+ var offC=resolveColor('var(--primary)'),pkC=resolveColor('var(--orp)');
+ var labels=days.map(function(d){return (''+(d.date||'')).slice(5);});
+ var data={labels:labels,datasets:[
+  {label:'off-peak',data:days.map(function(d){return +(d.offpeak_hours||0);}),backgroundColor:offC,borderRadius:3,stack:'h'},
+  {label:'peak',data:days.map(function(d){return +(d.peak_hours||0);}),backgroundColor:pkC,borderRadius:3,stack:'h'}]};
+ var opts={responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},
+  plugins:{legend:{display:false},tooltip:{callbacks:{
+    label:function(c){return c.dataset.label+': '+(+c.parsed.y).toFixed(1)+' h';},
+    footer:function(items){var d=days[items[0].dataIndex];var tot=(+(d.peak_hours||0))+(+(d.offpeak_hours||0));
+      var cost=(+(d.peak_hours||0))*kw*pk+(+(d.offpeak_hours||0))*kw*op;
+      return 'total '+tot.toFixed(1)+' h  '+cur+cost.toFixed(2);}}}},
+  scales:{x:{stacked:true,grid:{display:false},ticks:{color:tc,maxRotation:0,autoSkip:true,maxTicksLimit:10}},
+    y:{stacked:true,beginAtZero:true,grid:{color:gc},ticks:{color:tc},title:{display:true,text:'hours',color:tc}}}};
+ filtChart=new Chart(cv,{type:'bar',data:data,options:opts});
+ var last7=filtData.slice(-7);var p7=last7.reduce(function(s,d){return s+(+(d.peak_hours||0));},0),o7=last7.reduce(function(s,d){return s+(+(d.offpeak_hours||0));},0);
+ var cost7=p7*kw*pk+o7*kw*op;
+ document.getElementById('filtSummary').innerHTML='<span class="k">Last 7 days</span><span class="v">'+(p7+o7).toFixed(1)+' h &middot; '+cur+cost7.toFixed(2)+'</span>';}
 
 // ---------- bottle modals ----------
 var bmChem='cl';
@@ -1415,7 +1513,7 @@ function drawCorr(){if(document.getElementById('corrCard').style.display==='none
  if(corrChart)corrChart.destroy();corrChart=new Chart(document.getElementById('chartCorr'),{type:'scatter',data:data,options:opts});}).catch(function(){});}
 
 // ---------- alerts ----------
-function buildAlerts(){var al=[];var r=(S&&S.reading)||{};
+function computeAlerts(){var al=[];
  if(S.last_error)al.push({sev:'bad',cat:'a',t:'Controller error',d:S.last_error});
  // lab out of range
  if(LAB&&LAB.tests)LAB.tests.forEach(function(t){var sc=zone(t.value,t.ideal_low,t.ideal_high);if(sc==='bad'){var lowhi=(t.value<t.ideal_low)?'low':'high';al.push({sev:t.key==='cc'?'bad':'warn',cat:'a',t:t.label+' '+lowhi,d:(t.value==null?'':(+t.value).toFixed(t.dec))+(t.unit?(' '+t.unit):'')+' (target '+(+t.ideal_low)+'-'+(+t.ideal_high)+')'});}});
@@ -1423,6 +1521,12 @@ function buildAlerts(){var al=[];var r=(S&&S.reading)||{};
  [['cl',S.cl_forecast,S.warn_remaining_l,'Chlorine'],['ph',S.ph_forecast,S.ph_warn_remaining_l,'pH-minus']].forEach(function(x){var fc=x[1];if(fc&&fc.remaining!=null&&fc.remaining<=(x[2]||5)){al.push({sev:'warn',cat:'r',t:x[3]+' getting low',d:fc.remaining.toFixed(1)+' L left'+(fc.days_left!=null?(' (~'+Math.round(fc.days_left)+' days)'):'')});}});
  // overdue tests
  if(LAB&&LAB.tests)LAB.tests.forEach(function(t){if(t.overdue)al.push({sev:'info',cat:'r',t:t.label+' test overdue',d:'last '+friendlyTime(t.ts)+' - '+overdueTxt(t)});});
+ return al;}
+function buildDashAlerts(){var al=computeAlerts();var body=document.getElementById('dashAlertsBody');if(!body)return;
+ if(!al.length){body.innerHTML='<div class="mut" style="font-size:13px;padding:8px 2px">All good - nothing needs attention.</div>';return;}
+ body.innerHTML=al.slice(0,5).map(function(a){return '<div class="darow"><span class="dadot '+a.sev+'"></span><div><div class="dat">'+a.t+'</div><div class="dad">'+a.d+'</div></div></div>';}).join('')
+  +(al.length>5?('<div class="mut" style="font-size:11.5px;padding:8px 2px 0">+ '+(al.length-5)+' more</div>'):'');}
+function buildAlerts(){var al=computeAlerts();
  var badge=document.getElementById('alertBadge');if(al.length){badge.style.display='flex';badge.textContent=al.length;}else badge.style.display='none';
  var need=al.filter(function(a){return a.cat==='a';}),rem=al.filter(function(a){return a.cat==='r';});
  function ic(sev){var w='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg>';var i='<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';return sev==='info'?i:w;}
@@ -1709,6 +1813,8 @@ def status_payload():
         "price_offpeak": kv_get("price_offpeak", 0.142),
         "offpeak_window": kv_get("offpeak_window", "22:00-06:00"),
         "currency": kv_get("currency", "EUR"),
+        "weather": kv_get("weather"),
+        "weather_place": kv_get("weather_place", ""),
     }
 
 
