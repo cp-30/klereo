@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.3.1"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.4.0"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -934,13 +934,15 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,san
 .cardhead .t svg{color:var(--primary)}
 .mut{color:var(--muted)}
 .wq{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
-.chip{background:var(--card2);border-radius:14px;padding:10px 3px 11px;text-align:center;cursor:pointer;border:2px solid transparent;transition:border-color .15s}
+.chip{background:var(--card2);border-radius:14px;padding:12px 12px 10px;text-align:left;cursor:pointer;border:2px solid transparent;transition:border-color .15s}
 .chip.sel{border-color:var(--primary)}
-.gaugewrap{text-align:center;line-height:0;margin-bottom:6px}
-.gaugewrap svg{display:inline-block;width:100%;max-width:92px}
-.gval{font-size:19px;font-weight:800;letter-spacing:-.5px;margin-top:2px}
-.gval small{font-size:10px;color:var(--muted);font-weight:600;margin-left:1px}
-.gname{font-size:12px;font-weight:700;margin-top:2px}
+.qlabel{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.qval{font-size:25px;font-weight:800;letter-spacing:-1px;margin-top:4px;line-height:1}
+.qval small{font-size:12px;color:var(--muted);font-weight:600;margin-left:2px}
+.qsub{font-size:11.5px;margin-top:4px}
+.qsub .w{font-weight:700}
+.qage{font-size:10px;color:var(--muted);margin-top:3px}
+.qbar{height:4px;border-radius:3px;margin-top:9px}
 .chip .dot{width:38px;height:38px;border-radius:50%;margin:0 auto 7px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px}
 .chip .v{font-size:20px;font-weight:800;letter-spacing:-.5px}
 .chip .s{font-size:11px;font-weight:700;margin-top:1px}
@@ -1012,7 +1014,7 @@ a{color:var(--primary)}
  #balanceSect .card,#balanceSect{margin-bottom:0}
  #errbox{max-width:1080px;margin:0 auto}
  .tabbar{max-width:660px;border-radius:16px 16px 0 0}
- .gaugewrap svg{max-width:120px}
+ .wq{grid-template-columns:repeat(2,1fr)}
 }
 </style></head><body>
 <div id="toast" class="toast"></div>
@@ -1055,13 +1057,13 @@ a{color:var(--primary)}
 
  <!-- DASHBOARD -->
  <div class="page active" id="p-dash"><div class="wrap">
-   <div class="card span" id="wqCard">
+   <div class="card" id="wqCard">
      <div class="cardhead"><div class="t">
        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2s6 6.5 6 11a6 6 0 0 1-12 0c0-4.5 6-11 6-11z"/></svg>
        Water quality</div><span class="mut" style="font-size:12px">tap a metric</span></div>
      <div class="wq" id="wq"></div>
    </div>
-   <div class="card span" id="detailCard" style="display:none">
+   <div class="card" id="detailCard" style="display:none">
      <div class="cardhead"><div class="t"><span id="dIcon"></span><span id="dTitle"></span></div><span class="mut" id="dAge"></span></div>
      <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:8px">
        <div class="big"><span id="dVal">-</span><small id="dUnit"></small></div>
@@ -1129,7 +1131,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.3.1</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.4.0</div>
  </div></div>
 
  <div class="tabbar">
@@ -1227,25 +1229,17 @@ function metrics(){var r=(S&&S.reading)||{};var fc=labTest('fc');
    temp:{title:'Water temp',gname:'Temp',dot:'T',color:'var(--temp)',val:r.temp,unit:'C',dec:1,lo:(S.temp_range||[])[0],hi:(S.temp_range||[])[1],live:true,src:'temp'}};
  return m;}
 var THERMO='<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V5a2 2 0 0 0-4 0v9.76a4 4 0 1 0 4 0z"/></svg>';
-function gaugeSvg(val,lo,hi){
- if(lo==null||hi==null){return '<svg viewBox="0 0 100 56" style="max-width:92px"><path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="var(--line)" stroke-width="9"/></svg>';}
- var gmin=lo-(hi-lo)*0.6, gmax=hi+(hi-lo)*0.6, mm=(hi-lo)*0.12;
- function ang(v){var t=Math.max(0,Math.min(1,(v-gmin)/(gmax-gmin)));return 180*(1-t);}
- function pt(a,rr){var r=a*Math.PI/180;return [(50+rr*Math.cos(r)).toFixed(2),(50-rr*Math.sin(r)).toFixed(2)];}
- function seg(v1,v2,col){var p1=pt(ang(v1),40),p2=pt(ang(v2),40);return '<path d="M '+p1[0]+' '+p1[1]+' A 40 40 0 0 1 '+p2[0]+' '+p2[1]+'" fill="none" stroke="'+col+'" stroke-width="9"/>';}
- var zones=seg(gmin,lo,'#ef4444')+seg(lo,lo+mm,'#eab308')+seg(lo+mm,hi-mm,'#22c55e')+seg(hi-mm,hi,'#eab308')+seg(hi,gmax,'#ef4444');
- var np=(val==null)?null:pt(ang(val),33);
- var needle=np?('<line x1="50" y1="50" x2="'+np[0]+'" y2="'+np[1]+'" stroke="var(--text)" stroke-width="2.6" stroke-linecap="round"/>'):'';
- return '<svg viewBox="0 0 100 56">'+zones+needle+'<circle cx="50" cy="50" r="4" fill="var(--text)"/></svg>';}
 function buildWQ(){var m=metrics();var order=['orp','ph','cl','temp'];
- document.getElementById('wq').innerHTML=order.map(function(k){var x=m[k];var si=statusInfo(x.val,x.lo,x.hi);
+ document.getElementById('wq').innerHTML=order.map(function(k){var x=m[k];var si=statusInfo(x.val,x.lo,x.hi);var col=scColor(si.sc);
   var val=(x.val==null?'-':(+x.val).toFixed(x.dec));
-  var age=x.live?'live':(x.ts?labTime(x.ts):'no test');
+  var rng=(x.lo!=null&&x.hi!=null)?((+x.lo)+'-'+(+x.hi)):'';
+  var age=x.live?'live':(x.ts?labTime(x.ts):'');
   return '<div class="chip" data-k="'+k+'" onclick="showDetail(this.dataset.k)">'
-    +'<div class="gaugewrap">'+gaugeSvg(x.val,x.lo,x.hi)+'</div>'
-    +'<div class="gval">'+val+(x.unit?('<small>'+x.unit+'</small>'):'')+'</div>'
-    +'<div class="gname">'+x.gname+'</div>'
-    +'<div class="s '+si.sc+'">'+si.txt+'</div><div class="age">'+age+'</div></div>';
+    +'<div class="qlabel">'+x.gname+'</div>'
+    +'<div class="qval" style="color:'+(si.sc?col:'var(--text)')+'">'+val+(x.unit?('<small>'+x.unit+'</small>'):'')+'</div>'
+    +'<div class="qsub"><span class="w" style="color:'+col+'">'+si.txt+'</span>'+(rng?(' <span class="mut">&middot; '+rng+'</span>'):'')+'</div>'
+    +(age?('<div class="qage">'+age+'</div>'):'')
+    +'<div class="qbar" style="background:'+(si.sc?col:'var(--line)')+'"></div></div>';
  }).join('');
  if(!curDetail)curDetail='orp';}
 // ---------- balance (slow lab-tested chemistry) ----------
