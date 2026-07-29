@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.8.4"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.8.5"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -232,25 +232,21 @@ def current_bottle(chem):
 
 
 def bottle_used_l(chem, odo_now=None):
-    """Litres of product used from the current bottle (None if no bottle/odometer).
+    """Litres of product used from the current bottle (None if no bottle).
 
-    The lifetime odometer only ever counts up and survives power cuts, so we take
-    the MAX odometer seen since the bottle was fitted rather than just the latest
-    reading -- that way a single low/garbage poll after an outage can't dent the
-    running total and wrongly inflate 'remaining'."""
+    Counts the recorded odometer climbs since the bottle was fitted, so it stays
+    correct through reboots that erase runtime from the controller's own counter.
+    Passing `odo_now` forces a simple endpoint difference (used by the history
+    view for already-replaced bottles)."""
     b = current_bottle(chem)
     if not b or b.get("baseline") is None:
         return None
-    if odo_now is None:
-        col = CHEM[chem]["odo"]
-        with db() as c:
-            r = c.execute(f"SELECT MAX({col}) AS v FROM readings "
-                          f"WHERE {col} IS NOT NULL AND ts>=?", (b["fitted_at"],)).fetchone()
-        odo_now = r["v"] if r and r["v"] is not None else _chem_odo(kv_get("last_reading"), chem)
-    if odo_now is None:
+    if odo_now is not None:
+        factor = b.get("factor") or _chem_factor(chem)
+        return max((odo_now - b["baseline"]) * factor, 0.0)
+    if not b.get("fitted_at"):
         return None
-    factor = b.get("factor") or _chem_factor(chem)
-    return max((odo_now - b["baseline"]) * factor, 0.0)
+    return _used_litres_since(chem, b["fitted_at"], b["baseline"])
 
 
 def bottle_history(chem):
@@ -579,10 +575,22 @@ def _daily_usage(chem, days=130):
     with db() as c:
         rows = c.execute(f"SELECT ts,{col} AS odo,debit FROM readings "
                          f"WHERE {col} IS NOT NULL AND ts>=? ORDER BY ts", (cutoff,)).fetchall()
+    per_day = {}
+    for iso, litres in _usage_increments(rows, chem):
+        per_day[iso[:10]] = per_day.get(iso[:10], 0.0) + litres
+    return per_day
+
+
+def _usage_increments(rows, chem):
+    """The one robust engine behind every 'how much product' figure. Given
+    odometer rows (each with ts, odo, debit) in time order, return (iso_ts,
+    litres) for each genuine positive counter step. It is immune to:
+      * reboots that roll the counter backwards      -> negative steps ignored,
+      * a single garbage low poll that recovers      -> that poll is dropped,
+      * a stale counter that jumps in bursts         -> each jump is capped by how
+        long the value had been sitting (a 'plateau'), the longest the pump could
+        have run, which lets real catch-up jumps through but bounds a spike."""
     ph_rate = float(kv_get("ph_pump_lph", 1.5))
-    # parse to points, dropping isolated downward spikes (a single bad poll that
-    # dips then recovers to the prior level) while KEEPING sustained rollbacks
-    # (a reboot leaves the counter low and it climbs again from there).
     TOL = 30.0
     pts = []
     for r in rows:
@@ -596,34 +604,41 @@ def _daily_usage(chem, days=130):
         if 0 < i < len(pts) - 1:
             prev_o, next_o = pts[i - 1][1], pts[i + 1][1]
             if p[1] < prev_o - TOL and next_o >= prev_o - TOL:
-                continue                              # V-shaped glitch -> drop this poll
+                continue                              # isolated dip (one bad poll) -> drop
         clean.append(p)
-    per_day, prev_t, prev_o, plateau_t = {}, None, None, None
+    out, prev_t, prev_o, plateau_t = [], None, None, None
     for t, odo, debit, iso in clean:
         if prev_o is None:
             plateau_t = t
         else:
             step = odo - prev_o
             if step > 0:
-                # The counter often sits on a stale value then jumps in a burst
-                # when it refreshes, so a jump can be bigger than the gap to the
-                # previous reading. Cap instead by how long the value had been
-                # sitting (its 'plateau') -- the pump can't have run longer than
-                # that -- which allows genuine catch-up jumps but still bounds a
-                # garbage spike to the plateau length.
                 cap = max(t - (plateau_t if plateau_t is not None else prev_t), 0.0) * 1.2 + 5.0
                 run = min(step, cap)
-                if chem == "cl":
-                    litres = run * float(debit or 15.0) / 36000.0
-                else:
-                    litres = run * ph_rate / 3600.0
-                per_day[iso[:10]] = per_day.get(iso[:10], 0.0) + litres
+                litres = (run * float(debit or 15.0) / 36000.0) if chem == "cl" else (run * ph_rate / 3600.0)
+                out.append((iso, litres))
                 plateau_t = t                         # a new value starts a new plateau
             elif step < 0:
                 plateau_t = t                         # reboot/dip resets the plateau
             # step == 0: still sitting on the same value -> keep plateau_t
         prev_t, prev_o = t, odo
-    return per_day
+    return out
+
+
+def _used_litres_since(chem, since_iso, baseline=None):
+    """Total litres dosed since `since_iso` (e.g. a bottle's fitted time), summed
+    from the recorded odometer climbs -- so it still counts runtime that a later
+    reboot erased from the controller's own counter. Anchored at `baseline` (the
+    odometer value when the bottle was fitted) so nothing before our first stored
+    reading is missed."""
+    col = CHEM[chem]["odo"]
+    with db() as c:
+        after = c.execute(f"SELECT ts,{col} AS odo,debit FROM readings "
+                          f"WHERE {col} IS NOT NULL AND ts>=? ORDER BY ts", (since_iso,)).fetchall()
+    rows = list(after)
+    if baseline is not None:
+        rows = [{"ts": since_iso, "odo": baseline, "debit": None}] + rows
+    return sum(l for _, l in _usage_increments(rows, chem))
 
 
 def today_dose_ml(chem):
@@ -1316,7 +1331,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.4</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.5</div>
  </div></div>
 
  <div class="tabbar">
