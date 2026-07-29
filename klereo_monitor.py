@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.8.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.8.1"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -232,12 +232,21 @@ def current_bottle(chem):
 
 
 def bottle_used_l(chem, odo_now=None):
-    """Litres of product used from the current bottle (None if no bottle/odometer)."""
+    """Litres of product used from the current bottle (None if no bottle/odometer).
+
+    The lifetime odometer only ever counts up and survives power cuts, so we take
+    the MAX odometer seen since the bottle was fitted rather than just the latest
+    reading -- that way a single low/garbage poll after an outage can't dent the
+    running total and wrongly inflate 'remaining'."""
     b = current_bottle(chem)
     if not b or b.get("baseline") is None:
         return None
     if odo_now is None:
-        odo_now = _chem_odo(kv_get("last_reading"), chem)
+        col = CHEM[chem]["odo"]
+        with db() as c:
+            r = c.execute(f"SELECT MAX({col}) AS v FROM readings "
+                          f"WHERE {col} IS NOT NULL AND ts>=?", (b["fitted_at"],)).fetchone()
+        odo_now = r["v"] if r and r["v"] is not None else _chem_odo(kv_get("last_reading"), chem)
     if odo_now is None:
         return None
     factor = b.get("factor") or _chem_factor(chem)
@@ -555,15 +564,29 @@ def poll_once():
 
 
 def today_dose_ml(chem):
-    """mL of product dosed so far today, from the odometer's within-day delta."""
+    """mL of product dosed so far today.
+
+    Uses the day-boundary difference of the lifetime odometer (today's running
+    MAX minus the cumulative total at the end of yesterday). Because it takes the
+    MAX per day it is immune to a spurious low reading from a power cut / partial
+    poll, and because it reads the lifetime counter (not the controller's own
+    daily counter) it stays correct even when the controller reboots and resets
+    its 'today' figure mid-day."""
     col = CHEM[chem]["odo"]
     today = datetime.now(timezone.utc).astimezone().date().isoformat()
     with db() as c:
-        row = c.execute(f"SELECT MIN({col}) AS lo, MAX({col}) AS hi FROM readings "
-                        f"WHERE date(ts)=? AND {col} IS NOT NULL", (today,)).fetchone()
-    if not row or row["lo"] is None or row["hi"] is None:
+        hi = c.execute(f"SELECT MAX({col}) AS v FROM readings "
+                       f"WHERE date(ts)=? AND {col} IS NOT NULL", (today,)).fetchone()["v"]
+        start = c.execute(f"SELECT MAX({col}) AS v FROM readings "
+                          f"WHERE date(ts)<? AND {col} IS NOT NULL", (today,)).fetchone()["v"]
+        if hi is None:
+            return None
+        if start is None:                    # first day of data: anchor to today's first reading
+            start = c.execute(f"SELECT MIN({col}) AS v FROM readings "
+                              f"WHERE date(ts)=? AND {col} IS NOT NULL", (today,)).fetchone()["v"]
+    if start is None:
         return None
-    return max(row["hi"] - row["lo"], 0.0) * _chem_factor(chem) * 1000.0
+    return max(hi - start, 0.0) * _chem_factor(chem) * 1000.0
 
 
 def _check_bottle_alerts(chem, pool_name):
@@ -918,6 +941,10 @@ def weather_poll_once(force=False):
 
 
 def poller_loop():
+    try:                                  # refresh weather immediately on start/deploy
+        weather_poll_once(force=True)
+    except Exception as e:
+        print("[weather] startup fetch error:", e)
     while True:
         try:
             with _lock:
@@ -1241,7 +1268,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.0</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.1</div>
  </div></div>
 
  <div class="tabbar">
