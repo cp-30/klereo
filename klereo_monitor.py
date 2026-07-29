@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.8.3"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.8.4"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -598,18 +598,30 @@ def _daily_usage(chem, days=130):
             if p[1] < prev_o - TOL and next_o >= prev_o - TOL:
                 continue                              # V-shaped glitch -> drop this poll
         clean.append(p)
-    per_day, prev_t, prev_o = {}, None, None
+    per_day, prev_t, prev_o, plateau_t = {}, None, None, None
     for t, odo, debit, iso in clean:
-        if prev_o is not None:
-            step = odo - prev_o                       # odometer seconds since last reading
+        if prev_o is None:
+            plateau_t = t
+        else:
+            step = odo - prev_o
             if step > 0:
-                cap = max(t - prev_t, 0.0) * 1.2 + 5.0   # most real run-time possible in the gap
+                # The counter often sits on a stale value then jumps in a burst
+                # when it refreshes, so a jump can be bigger than the gap to the
+                # previous reading. Cap instead by how long the value had been
+                # sitting (its 'plateau') -- the pump can't have run longer than
+                # that -- which allows genuine catch-up jumps but still bounds a
+                # garbage spike to the plateau length.
+                cap = max(t - (plateau_t if plateau_t is not None else prev_t), 0.0) * 1.2 + 5.0
                 run = min(step, cap)
                 if chem == "cl":
                     litres = run * float(debit or 15.0) / 36000.0
                 else:
                     litres = run * ph_rate / 3600.0
                 per_day[iso[:10]] = per_day.get(iso[:10], 0.0) + litres
+                plateau_t = t                         # a new value starts a new plateau
+            elif step < 0:
+                plateau_t = t                         # reboot/dip resets the plateau
+            # step == 0: still sitting on the same value -> keep plateau_t
         prev_t, prev_o = t, odo
     return per_day
 
@@ -1304,7 +1316,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.3</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.4</div>
  </div></div>
 
  <div class="tabbar">
