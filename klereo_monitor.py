@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.8.5"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.9.0"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -179,6 +179,8 @@ def init_db():
             key, _label, _dec = _param_meta(pname)
             c.execute("UPDATE lab_tests SET param_key=? WHERE parameter=? AND param_key<>?",
                       (key, pname, key))
+        # drop any out-of-range 'OR' sentinel readings (1e6) stored by old versions
+        c.execute("DELETE FROM lab_tests WHERE value IS NOT NULL AND ABS(value) >= 100000")
     # one-time migration: fold the old single chlorine baseline into bottles[]
     _migrate_legacy_bottle()
 
@@ -890,27 +892,57 @@ def labcom_fetch(token):
     return data
 
 
+# PoolLab reports "OR" (outside range) as a huge sentinel value (1e6). No real
+# pool parameter ever reaches this, so anything at/above it is discarded.
+LAB_SENTINEL = 100000.0
+
+
 def labcom_store(cloud):
-    """Insert any new measurements (dedup on measurement id). Returns count added."""
-    added = 0
+    """Sync measurements to mirror the cloud: insert new ones (dedup on id),
+    drop out-of-range sentinel readings, and remove rows the user deleted in the
+    cloud. Returns count added."""
+    added = removed = 0
+    cloud_ids, acct_ids = [], []
     with db() as c:
         for acct in (cloud.get("Accounts") or []):
             aid = acct.get("id")
+            acct_ids.append(str(aid))
             for m in (acct.get("Measurements") or []):
                 mid = m.get("id")
                 if mid is None:
                     continue
+                cloud_ids.append(str(mid))
+                val = _to_float(m.get("value"))
+                if val is not None and abs(val) >= LAB_SENTINEL:
+                    continue                          # "OR" / outside-range -> don't store
                 key, _label, _dec = _param_meta(m.get("parameter"))
                 cur = c.execute("INSERT OR IGNORE INTO lab_tests "
                                 "(meas_id,ts,account_id,parameter,param_key,value,unit,"
                                 " ideal_low,ideal_high,operator,comment,device_serial) "
                                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                                 (str(mid), _ts_iso(m.get("timestamp")), str(aid),
-                                 m.get("parameter"), key, _to_float(m.get("value")),
+                                 m.get("parameter"), key, val,
                                  m.get("unit"), _to_float(m.get("ideal_low")),
                                  _to_float(m.get("ideal_high")), m.get("operator_name"),
                                  m.get("comment"), m.get("device_serial")))
                 added += cur.rowcount
+        # Mirror deletions: remove local rows for the returned accounts whose id is
+        # no longer in the cloud -- but only when we actually got measurements back,
+        # so a bad/empty response can never wipe local history.
+        if cloud_ids and acct_ids:
+            qa = ",".join("?" * len(acct_ids))
+            qi = ",".join("?" * len(cloud_ids))
+            cur = c.execute(
+                f"DELETE FROM lab_tests WHERE account_id IN ({qa}) "
+                f"AND meas_id IS NOT NULL AND meas_id NOT IN ({qi})",
+                acct_ids + cloud_ids)
+            removed += cur.rowcount
+        # Belt-and-braces: clear any sentinel rows stored by earlier versions.
+        cur = c.execute("DELETE FROM lab_tests WHERE value IS NOT NULL AND ABS(value) >= ?",
+                        (LAB_SENTINEL,))
+        removed += cur.rowcount
+    if removed:
+        print(f"[labcom] removed {removed} stale/out-of-range lab row(s)")
     return added
 
 
@@ -1331,7 +1363,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.5</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.9.0</div>
  </div></div>
 
  <div class="tabbar">
