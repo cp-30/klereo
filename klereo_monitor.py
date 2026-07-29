@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.8.1"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.8.2"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -305,11 +305,11 @@ def bottle_forecast(chem):
     out["pct"] = max(0.0, min(100.0, (remaining / size * 100.0))) if size > 0 else None
     tml = today_dose_ml(chem)
     out["used_today"] = (tml / 1000.0) if tml is not None else None
-    # average daily consumption from per-day usage over the window
-    daily = usage_payload(chem)
-    recent = daily[-avg_days:] if daily else []
+    # average daily consumption over the last `avg_days` days
+    du = _daily_usage(chem, days=avg_days + 3)
+    recent = [du[d] for d in sorted(du)[-avg_days:]]
     if recent:
-        avg = sum(d["litres"] for d in recent) / len(recent)
+        avg = sum(recent) / len(recent)
         out["avg_per_day"] = avg
         if avg > 0:
             days_left = remaining / avg
@@ -563,30 +563,66 @@ def poll_once():
     return reading
 
 
-def today_dose_ml(chem):
-    """mL of product dosed so far today.
+def _daily_usage(chem, days=130):
+    """Litres of product dosed per calendar day, robust to power events.
 
-    Uses the day-boundary difference of the lifetime odometer (today's running
-    MAX minus the cumulative total at the end of yesterday). Because it takes the
-    MAX per day it is immune to a spurious low reading from a power cut / partial
-    poll, and because it reads the lifetime counter (not the controller's own
-    daily counter) it stays correct even when the controller reboots and resets
-    its 'today' figure mid-day."""
+    Walks the odometer readings in order and sums only the POSITIVE step-to-step
+    increments, each capped at the real elapsed time between readings (the pump
+    can't have run longer than the wall clock). A controller reboot that rolls
+    the counter back shows up as a negative step, which is ignored; the counter
+    then climbs again and those genuine increments are still counted -- so
+    post-reboot dosing is captured correctly. A spurious high spike is clipped by
+    the elapsed-time cap. Returns {'YYYY-MM-DD': litres}."""
+    from datetime import timedelta
     col = CHEM[chem]["odo"]
-    today = datetime.now(timezone.utc).astimezone().date().isoformat()
+    cutoff = (datetime.now(timezone.utc).astimezone() - timedelta(days=days)).isoformat()
     with db() as c:
-        hi = c.execute(f"SELECT MAX({col}) AS v FROM readings "
-                       f"WHERE date(ts)=? AND {col} IS NOT NULL", (today,)).fetchone()["v"]
-        start = c.execute(f"SELECT MAX({col}) AS v FROM readings "
-                          f"WHERE date(ts)<? AND {col} IS NOT NULL", (today,)).fetchone()["v"]
-        if hi is None:
-            return None
-        if start is None:                    # first day of data: anchor to today's first reading
-            start = c.execute(f"SELECT MIN({col}) AS v FROM readings "
-                              f"WHERE date(ts)=? AND {col} IS NOT NULL", (today,)).fetchone()["v"]
-    if start is None:
+        rows = c.execute(f"SELECT ts,{col} AS odo,debit FROM readings "
+                         f"WHERE {col} IS NOT NULL AND ts>=? ORDER BY ts", (cutoff,)).fetchall()
+    ph_rate = float(kv_get("ph_pump_lph", 1.5))
+    # parse to points, dropping isolated downward spikes (a single bad poll that
+    # dips then recovers to the prior level) while KEEPING sustained rollbacks
+    # (a reboot leaves the counter low and it climbs again from there).
+    TOL = 30.0
+    pts = []
+    for r in rows:
+        try:
+            pts.append([datetime.fromisoformat(r["ts"]).timestamp(), r["odo"],
+                        r["debit"], str(r["ts"])])
+        except (ValueError, TypeError):
+            continue
+    clean = []
+    for i, p in enumerate(pts):
+        if 0 < i < len(pts) - 1:
+            prev_o, next_o = pts[i - 1][1], pts[i + 1][1]
+            if p[1] < prev_o - TOL and next_o >= prev_o - TOL:
+                continue                              # V-shaped glitch -> drop this poll
+        clean.append(p)
+    per_day, prev_t, prev_o = {}, None, None
+    for t, odo, debit, iso in clean:
+        if prev_o is not None:
+            step = odo - prev_o                       # odometer seconds since last reading
+            if step > 0:
+                cap = max(t - prev_t, 0.0) * 1.2 + 5.0   # most real run-time possible in the gap
+                run = min(step, cap)
+                if chem == "cl":
+                    litres = run * float(debit or 15.0) / 36000.0
+                else:
+                    litres = run * ph_rate / 3600.0
+                per_day[iso[:10]] = per_day.get(iso[:10], 0.0) + litres
+        prev_t, prev_o = t, odo
+    return per_day
+
+
+def today_dose_ml(chem):
+    """mL of product dosed so far today (robust to power events -- see _daily_usage)."""
+    col = CHEM[chem]["odo"]
+    with db() as c:
+        any_row = c.execute(f"SELECT 1 FROM readings WHERE {col} IS NOT NULL LIMIT 1").fetchone()
+    if not any_row:
         return None
-    return max(hi - start, 0.0) * _chem_factor(chem) * 1000.0
+    today = datetime.now(timezone.utc).astimezone().date().isoformat()
+    return _daily_usage(chem, days=2).get(today, 0.0) * 1000.0
 
 
 def _check_bottle_alerts(chem, pool_name):
@@ -1268,7 +1304,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.1</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.2</div>
  </div></div>
 
  <div class="tabbar">
@@ -2089,41 +2125,12 @@ def filter_usage_payload():
 
 
 def usage_payload(chem="cl"):
-    """Product used per calendar day, derived from the lifetime odometer.
-    chlorine: total_time * debit / 36000; pH: ph_total * pump_L/h / 3600.
-    Daily use = day-end minus previous day-end. Returns [{date, litres}]."""
+    """Product used per calendar day, robust to power events (see _daily_usage).
+    Returns [{date, litres}]."""
     if chem not in CHEM:
         chem = "cl"
-    col = CHEM[chem]["odo"]
-    with db() as c:
-        if chem == "cl":
-            rows = c.execute(
-                "SELECT date(ts) AS d, MAX(total_time) AS tt, "
-                "       (SELECT debit FROM readings r2 WHERE date(r2.ts)=date(r1.ts) "
-                "        AND debit IS NOT NULL ORDER BY ts DESC LIMIT 1) AS debit "
-                "FROM readings r1 WHERE total_time IS NOT NULL "
-                "GROUP BY d ORDER BY d").fetchall()
-        else:
-            rows = c.execute(
-                f"SELECT date(ts) AS d, MAX({col}) AS tt FROM readings "
-                f"WHERE {col} IS NOT NULL GROUP BY d ORDER BY d").fetchall()
-    rate = float(kv_get("ph_pump_lph", 1.5))
-    out, prev = [], None
-    for r in rows:
-        tt = r["tt"]
-        if tt is None:
-            continue
-        if chem == "cl":
-            debit = r["debit"]
-            if debit is None:
-                continue
-            cum = tt * debit / 36000.0
-        else:
-            cum = tt * rate / 3600.0
-        if prev is not None:
-            out.append({"date": r["d"], "litres": round(max(cum - prev, 0), 3)})
-        prev = cum
-    return out[-120:]
+    du = _daily_usage(chem)
+    return [{"date": d, "litres": round(du[d], 3)} for d in sorted(du)][-120:]
 
 
 def _odo_at(chem, at_ms):
