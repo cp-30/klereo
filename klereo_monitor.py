@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.7.1"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.8.0"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -171,11 +171,14 @@ def init_db():
     if kv_get("weather_place")   is None: kv_set("weather_place", "Saint-Laurent-de-Ceris")
     # PoolLab / LabCom lab-test sync
     if kv_get("labcom_poll_hours") is None: kv_set("labcom_poll_hours", 1.0)
-    # re-key any lab rows stored before a parameter was added to LAB_PARAMS
+    # re-key any lab rows to the canonical key for their parameter name, so rows
+    # stored before a mapping/keyword existed (e.g. alkalinity) grade correctly.
     with db() as c:
-        for pname, meta in LAB_PARAMS.items():
+        for row in c.execute("SELECT DISTINCT parameter FROM lab_tests").fetchall():
+            pname = row["parameter"]
+            key, _label, _dec = _param_meta(pname)
             c.execute("UPDATE lab_tests SET param_key=? WHERE parameter=? AND param_key<>?",
-                      (meta["key"], pname, meta["key"]))
+                      (key, pname, key))
     # one-time migration: fold the old single chlorine baseline into bottles[]
     _migrate_legacy_bottle()
 
@@ -736,10 +739,36 @@ def _live_range(key, seuil_min=None, seuil_max=None):
     return LIVE_RANGE_DEFAULTS.get(key, (None, None))
 
 
+# Keyword fallbacks so naming variants across PoolLab firmware/locales still map
+# to a canonical key (and therefore pick up a target band). First match wins;
+# order matters (the specific chlorine phrases must precede the generic "chlor").
+_PARAM_ALIASES = [
+    ("cyanuric",       ("cya",  "Cyanuric acid (CYA)", 0)),
+    ("alkalin",        ("alk",  "Total alkalinity",    0)),
+    ("t-alka",         ("alk",  "Total alkalinity",    0)),
+    ("calcium",        ("ch",   "Calcium hardness",    0)),
+    ("hardness",       ("ch",   "Calcium hardness",    0)),
+    ("phosph",         ("po4",  "Phosphate",           2)),
+    ("bromin",         ("br",   "Bromine",             2)),
+    ("combined chlor", ("cc",   "Combined chlorine",   2)),
+    ("total chlor",    ("tc",   "Total chlorine",      2)),
+    ("free chlor",     ("fc",   "Free chlorine",       2)),
+    ("salt",           ("salt", "Salt",                0)),
+]
+
+
 def _param_meta(parameter):
     m = LAB_PARAMS.get(parameter)
     if m:
         return m["key"], m["label"], m["dec"]
+    low = (parameter or "").lower()
+    for kw, meta in _PARAM_ALIASES:
+        if kw in low:
+            return meta
+    if re.search(r"\bph\b", low):            # whole word, so 'phosphate' isn't caught
+        return ("ph", "pH", 2)
+    if "chlor" in low:                       # unqualified chlorine -> free chlorine
+        return ("fc", "Free chlorine", 2)
     # normalize an unknown parameter: strip "PL ", slug the key
     label = re.sub(r"^PL\s+", "", parameter or "").strip() or (parameter or "?")
     key = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "param"
@@ -868,12 +897,20 @@ def weather_poll_once(force=False):
     resp = requests.get(WEATHER_URL, params={
         "latitude": lat, "longitude": lon,
         "current": "temperature_2m,weather_code,is_day",
-        "timezone": "auto"}, timeout=10)
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "forecast_days": 1, "timezone": "auto"}, timeout=10)
     resp.raise_for_status()
-    cur = (resp.json() or {}).get("current") or {}
+    body = resp.json() or {}
+    cur = body.get("current") or {}
+    daily = body.get("daily") or {}
+
+    def _first(seq):
+        return seq[0] if isinstance(seq, list) and seq else None
     w = {"temp": cur.get("temperature_2m"),
          "code": cur.get("weather_code"),
          "is_day": cur.get("is_day"),
+         "tmax": _first(daily.get("temperature_2m_max")),
+         "tmin": _first(daily.get("temperature_2m_min")),
          "ts": now_iso()}
     kv_set("weather", w)
     kv_set("weather_ts", now_iso())
@@ -976,6 +1013,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,san
 .iconbtn{width:38px;height:38px;border-radius:12px;border:0;background:var(--card);box-shadow:var(--shadow);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer}
 .weather{display:flex;align-items:center;gap:5px;font-size:15px;font-weight:700;color:var(--text)}
 .weather svg{color:var(--orp)}
+.weather .whl{font-weight:500;font-size:11px;color:var(--muted);margin-left:1px}
 .weather:empty{display:none}
 .wrap{padding:6px 15px}
 .sect{font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);margin:16px 4px 9px}
@@ -1203,7 +1241,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.7.1</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.0</div>
  </div></div>
 
  <div class="tabbar">
@@ -1246,7 +1284,8 @@ function wmo(code){var m={0:['sun','Clear'],1:['sun','Mainly clear'],2:['pcloud'
 function renderWeather(w,place){var el=document.getElementById('weather');if(!el)return;
  if(!w||w.temp==null){el.innerHTML='';el.title='';return;}
  var wi=wmo(w.code);
- el.innerHTML=wIcon(wi[0])+'<span>'+Math.round(w.temp)+'&deg;</span>';
+ var hl=(w.tmin!=null&&w.tmax!=null)?('<small class="whl">(L '+Math.round(w.tmin)+'&deg; / H '+Math.round(w.tmax)+'&deg;)</small>'):'';
+ el.innerHTML=wIcon(wi[0])+'<span>'+Math.round(w.temp)+'&deg;</span>'+hl;
  el.title=wi[1]+(place?(' at '+place):'');}
 function go(p){document.querySelectorAll('.page').forEach(function(x){x.classList.remove('active')});
  document.getElementById('p-'+p).classList.add('active');
