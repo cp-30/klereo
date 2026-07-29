@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.8.2"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.8.3"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -1304,7 +1304,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.2</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.8.3</div>
  </div></div>
 
  <div class="tabbar">
@@ -2133,6 +2133,59 @@ def usage_payload(chem="cl"):
     return [{"date": d, "litres": round(du[d], 3)} for d in sorted(du)][-120:]
 
 
+def diag_usage_payload(chem="cl"):
+    """Diagnostics for 'used today': shows whether the counter rolled back or the
+    poller went stale, and both ways of computing today, plus recent readings."""
+    if chem not in CHEM:
+        chem = "cl"
+    col = CHEM[chem]["odo"]
+    now = datetime.now(timezone.utc).astimezone()
+    today = now.date().isoformat()
+    extra = kv_get("last_extra") or {}
+    lr = kv_get("last_reading") or {}
+    with db() as c:
+        recent = [dict(r) for r in c.execute(
+            f"SELECT ts,{col} AS odo FROM readings WHERE {col} IS NOT NULL "
+            f"ORDER BY ts DESC LIMIT 40").fetchall()][::-1]
+        y_end = c.execute(f"SELECT MAX({col}) AS v FROM readings "
+                          f"WHERE date(ts)<? AND {col} IS NOT NULL", (today,)).fetchone()["v"]
+        latest = c.execute(f"SELECT ts,{col} AS odo FROM readings "
+                           f"WHERE {col} IS NOT NULL ORDER BY ts DESC LIMIT 1").fetchone()
+    factor = _chem_factor(chem)
+    last_ok = kv_get("last_ok")
+    mins_since = None
+    try:
+        mins_since = round((now - datetime.fromisoformat(last_ok)).total_seconds() / 60.0, 1)
+    except (ValueError, TypeError):
+        pass
+    simple_ml = None
+    if latest and latest["odo"] is not None and y_end is not None:
+        simple_ml = round(max(latest["odo"] - y_end, 0.0) * factor * 1000.0, 1)
+    incr = today_dose_ml(chem)
+    # count backward steps in recent history (a sign of reboot rollbacks/glitches)
+    backsteps = sum(1 for i in range(1, len(recent))
+                    if recent[i]["odo"] is not None and recent[i - 1]["odo"] is not None
+                    and recent[i]["odo"] < recent[i - 1]["odo"])
+    return {
+        "chem": chem, "now": now.isoformat(),
+        "last_ok": last_ok, "minutes_since_last_poll": mins_since,
+        "poll_minutes": kv_get("poll_minutes", POLL_MINUTES),
+        "odo_column": col,
+        "current_reading_odo": lr.get(col),
+        "latest_stored_odo": (latest["odo"] if latest else None),
+        "latest_stored_ts": (latest["ts"] if latest else None),
+        "yesterday_end_odo": y_end,
+        "today_via_current_minus_yesterday_ml": simple_ml,
+        "today_via_increment_sum_ml": (round(incr, 1) if incr is not None else None),
+        "HybChl_TotalTime": extra.get("HybChl_TotalTime"),
+        "HybChl_TodayTime": extra.get("HybChl_TodayTime"),
+        "HybChl_TodayTime_as_ml": (round(extra.get("HybChl_TodayTime") * (lr.get("debit") or 15.0) / 36.0, 1)
+                                   if extra.get("HybChl_TodayTime") is not None else None),
+        "backward_steps_in_last_40": backsteps,
+        "recent_readings": [{"ts": r["ts"], "odo": r["odo"]} for r in recent],
+    }
+
+
 def _odo_at(chem, at_ms):
     """(odometer, debit, fitted_iso) nearest to a past time; None target -> now."""
     col = CHEM[chem]["odo"]
@@ -2353,6 +2406,9 @@ class Handler(BaseHTTPRequestHandler):
                                                q.get("probe", ["orp"])[0]))
         elif path == "/api/raw":
             self._json(raw_payload())
+        elif path == "/api/diag-usage":
+            q = parse_qs(urlparse(self.path).query)
+            self._json(diag_usage_payload(q.get("chem", ["cl"])[0]))
         elif path == "/api/cover-latest.jpg":
             if os.path.exists(COVER_IMG):
                 with open(COVER_IMG, "rb") as fh:
