@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.9.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.10.0"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -1129,9 +1129,23 @@ PAGE = b"""<!doctype html><html lang="en"><head>
 html,body{overscroll-behavior-y:contain}
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);transition:background .3s,color .3s}
 .app{max-width:480px;margin:0 auto;min-height:100vh;padding:0 0 96px;position:relative}
-.top{display:flex;align-items:center;justify-content:space-between;padding:18px 16px 4px}
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:calc(env(safe-area-inset-top,0px) + 16px) 16px 4px}
 .top h1{font-size:21px;margin:0;letter-spacing:-.3px}
+.top .titlewrap{min-width:0}
 .top .sub{color:var(--muted);font-size:12.5px;margin-top:2px}
+/* first-paint loading overlay */
+#loader{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg);z-index:200;transition:opacity .35s}
+#loader.hide{opacity:0;pointer-events:none}
+.spinner{width:40px;height:40px;border:3px solid var(--line);border-top-color:var(--primary);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* status strip (stale data / filtration off) */
+.statusbar{display:flex;flex-wrap:wrap;gap:8px;padding:6px 15px 0}
+.statusbar:empty{display:none}
+.stbadge{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;padding:5px 11px;border-radius:999px}
+.stbadge.warn{background:var(--warnbg);color:var(--warn)} .stbadge.bad{background:var(--badbg);color:var(--bad)}
+.stbadge .d{width:7px;height:7px;border-radius:50%;background:currentColor}
+.mtf{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--muted)}
+.mtf input{width:100%}
 .iconbtn{width:38px;height:38px;border-radius:12px;border:0;background:var(--card);box-shadow:var(--shadow);color:var(--text);display:flex;align-items:center;justify-content:center;cursor:pointer}
 .weather{display:flex;align-items:center;gap:5px;font-size:15px;font-weight:700;color:var(--text)}
 .weather svg{color:var(--orp)}
@@ -1243,6 +1257,7 @@ a{color:var(--primary)}
  .wq{grid-template-columns:repeat(4,1fr)}
 }
 </style></head><body>
+<div id="loader"><div class="spinner"></div></div>
 <div id="toast" class="toast"></div>
 <div id="ptr" style="position:fixed;top:0;left:0;right:0;text-align:center;padding:8px;color:var(--muted);font-size:13px;transform:translateY(-40px);transition:transform .15s;z-index:6">&#8595; pull to refresh</div>
 
@@ -1272,15 +1287,36 @@ a{color:var(--primary)}
   </div>
   <div id="labGridBody" style="max-height:60vh;overflow:auto">loading...</div>
 </div></div>
+<div id="manualModal" class="modal"><div class="modalcard" style="width:400px">
+  <div style="font-size:16px;font-weight:700;margin-bottom:10px">Add manual test</div>
+  <div class="mut" style="font-size:12px;margin-bottom:4px">Date &amp; time (past only)</div>
+  <input type="datetime-local" id="mt_time" style="width:100%;margin-bottom:12px">
+  <div class="mut" style="font-size:12px;margin-bottom:8px">Enter only the values you measured &mdash; leave the rest blank.</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:9px">
+    <label class="mtf">pH<input id="mt_ph" type="number" step="0.01" inputmode="decimal"></label>
+    <label class="mtf">Free chlorine (mg/l)<input id="mt_fc" type="number" step="0.01" inputmode="decimal"></label>
+    <label class="mtf">Total chlorine (mg/l)<input id="mt_tc" type="number" step="0.01" inputmode="decimal"></label>
+    <label class="mtf">Combined chlorine (mg/l)<input id="mt_cc" type="number" step="0.01" inputmode="decimal"></label>
+    <label class="mtf">Cyanuric acid / CYA<input id="mt_cya" type="number" step="1" inputmode="decimal"></label>
+    <label class="mtf">Total alkalinity<input id="mt_alk" type="number" step="1" inputmode="decimal"></label>
+    <label class="mtf">Calcium hardness<input id="mt_ch" type="number" step="1" inputmode="decimal"></label>
+    <label class="mtf">Salt (mg/l)<input id="mt_salt" type="number" step="1" inputmode="decimal"></label>
+  </div>
+  <div style="display:flex;gap:10px;margin-top:16px">
+    <button type="button" class="btn s" onclick="closeManual()">Cancel</button>
+    <button type="button" class="btn p" onclick="saveManual()">Save test</button>
+  </div>
+</div></div>
 
 <div class="app">
  <div class="top">
-   <div><h1>Pool Stats <span id="nick" style="font-size:14px;color:var(--muted);font-weight:400"></span></h1>
+   <div class="titlewrap"><h1>Pool Stats <span id="nick" style="font-size:14px;color:var(--muted);font-weight:400"></span></h1>
      <div class="sub" id="sub">loading...</div></div>
-   <div style="display:flex;align-items:center;gap:12px">
+   <div style="display:flex;align-items:center;gap:12px;flex:0 0 auto">
      <div class="weather" id="weather"></div>
      <button class="iconbtn" id="themeBtn" onclick="cycleTheme()" title="Theme"></button></div>
  </div>
+ <div class="statusbar" id="statusbar"></div>
  <div id="errbox"></div>
 
  <!-- DASHBOARD -->
@@ -1347,7 +1383,8 @@ a{color:var(--primary)}
      <div class="mut" id="corrSummary" style="font-size:12.5px;margin-top:8px"></div>
    </div>
    <div class="card" id="labListCard">
-     <div class="cardhead"><div class="t">Lab tests</div><span class="mut" id="labWhen" style="font-size:12px"></span></div>
+     <div class="cardhead"><div class="t">Lab tests</div><button class="btn s" style="flex:0;padding:6px 11px;font-size:12.5px" onclick="openManual()">+ Add manual test</button></div>
+     <div class="mut" id="labWhen" style="font-size:12px;margin:-4px 0 8px"></div>
      <div id="labList"></div>
      <div class="mut" style="font-size:12px;margin-top:8px">Tap a test to see every reading &rarr;</div>
    </div>
@@ -1362,8 +1399,9 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Open full settings</span><a href="/config" class="v">Settings &rarr;</a></div>
      <div class="grow"><span class="k">Force a refresh now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="refresh()">Refresh</button></div>
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
+     <div class="grow"><span class="k">Add a manual water test</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="openManual()">Add test</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.9.0</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.10.0</div>
  </div></div>
 
  <div class="tabbar">
@@ -1460,20 +1498,31 @@ function animateLiquid(){requestAnimationFrame(function(){requestAnimationFrame(
  document.querySelectorAll('.liquid').forEach(function(el){el.style.transform='translateY('+el.dataset.final+'px)';});});});}
 
 // ---------- load ----------
+function hideLoader(){var l=document.getElementById('loader');if(l)l.classList.add('hide');}
+function pollAgeMin(){if(!S||!S.last_ok)return null;var d=new Date(S.last_ok);if(isNaN(d))return null;return (Date.now()-d.getTime())/60000;}
+function isStale(){var a=pollAgeMin();if(a==null)return false;var pm=(S&&S.poll_minutes)||15;return a>pm*1.8+3;}
+function buildStatus(){var el=document.getElementById('statusbar');if(!el)return;var r=(S&&S.reading)||{};var h='';
+ if(isStale())h+='<span class="stbadge bad"><span class="d"></span>Readings '+friendlyTime(S.last_ok)+'</span>';
+ if(r.filtration===0)h+='<span class="stbadge warn"><span class="d"></span>Filtration off</span>';
+ el.innerHTML=h;}
 function load(){
  return Promise.all([fetch('/api/status').then(function(r){return r.json();}),
    fetch('/api/lab-latest').then(function(r){return r.json();}).catch(function(){return {tests:[],configured:false};})])
- .then(function(res){S=res[0];LAB=res[1];render();}).catch(function(e){document.getElementById('sub').textContent='connection error';});}
+ .then(function(res){S=res[0];LAB=res[1];render();}).catch(function(e){document.getElementById('sub').textContent='connection error';hideLoader();});}
 function render(){
  var r=(S&&S.reading)||{};
  document.getElementById('nick').textContent=r.nickname||'';
- document.getElementById('sub').textContent='Updated '+friendlyTime(S.last_ok)+'  |  every '+S.poll_minutes+' min';
+ var sub=document.getElementById('sub');
+ sub.textContent='Updated '+friendlyTime(S.last_ok)+'  |  every '+S.poll_minutes+' min';
+ sub.style.color=isStale()?'var(--warn)':'';
  document.getElementById('errbox').innerHTML=S.last_error?('<div class="wrap"><div class="err">Last error: '+S.last_error+'</div></div>'):'';
  renderWeather(S.weather,S.weather_place);
+ buildStatus();
  buildWQ(); buildBalance(); buildBottles(); buildFilt(); buildLabList(); buildAlerts(); buildDashAlerts();
  if(curDetail)showDetail(curDetail);
  animateLiquid();
  drawPhOrp(); loadUsage(); loadCorr();
+ hideLoader();
 }
 
 // ---------- water quality ----------
@@ -1490,12 +1539,13 @@ function buildWQ(){var m=metrics();var order=['orp','ph','cl','temp'];
   var val=(x.val==null?'-':(+x.val).toFixed(x.dec));
   var unit=(x.unit||'').split(' ')[0];
   var rng=(x.lo!=null&&x.hi!=null)?((+x.lo)+'-'+(+x.hi)):'';
-  var age=x.live?'live':(x.ts?labTime(x.ts):'');
+  var stale=(x.live&&isStale());
+  var age=x.live?(stale?friendlyTime(S.last_ok):'live'):(x.ts?labTime(x.ts):'');
   return '<div class="chip" data-k="'+k+'" onclick="showDetail(this.dataset.k)">'
     +'<div class="qlabel">'+x.gname+'</div>'
     +'<div class="qval">'+val+(unit?('<small>'+unit+'</small>'):'')+'</div>'
     +'<div class="qsub"><span class="w" style="color:'+col+'">'+si.txt+'</span>'+(rng?(' <span class="mut">&middot; '+rng+'</span>'):'')+'</div>'
-    +(age?('<div class="qage">'+age+'</div>'):'')
+    +(age?('<div class="qage"'+(stale?' style="color:var(--warn);font-weight:700"':'')+'>'+age+'</div>'):'')
     +'</div>';
  }).join('');
  if(!curDetail)curDetail='orp';}
@@ -1627,9 +1677,13 @@ function buildLabList(){var c=document.getElementById('labListCard');if(!LAB||!L
  document.getElementById('labList').innerHTML=LAB.tests.map(function(t){var sc=zone(t.value,t.ideal_low,t.ideal_high);var due=t.overdue?(' <span class="pill2">'+overdueTxt(t)+'</span>'):'';
   return '<div class="grow" data-k="'+t.key+'" onclick="openLabGrid(this.dataset.k)" style="cursor:pointer"><span class="k">'+t.label+due+'</span><span class="v" style="color:'+(sc?scColor(sc):'inherit')+'">'+(t.value==null?'-':(+t.value).toFixed(t.dec))+' <small class="mut">'+labTime(t.ts)+'</small></span></div>';}).join('');}
 function overdueTxt(t){if(t.days_since==null||t.cadence==null)return 'due';var d=Math.round(t.days_since-t.cadence);return d>0?(d+' day'+(d===1?'':'s')+' overdue'):'due';}
-function openLabGrid(k){var t=labTest(k)||{};document.getElementById('labGridTitle').textContent=(t.label||k)+' - all readings';document.getElementById('labGridBody').innerHTML='loading...';document.getElementById('labGridModal').classList.add('show');
+var curGridKey=null;
+function openLabGrid(k){curGridKey=k;var t=labTest(k)||{};document.getElementById('labGridTitle').textContent=(t.label||k)+' - all readings';document.getElementById('labGridBody').innerHTML='loading...';document.getElementById('labGridModal').classList.add('show');renderLabGrid(t);}
+function renderLabGrid(t){var k=curGridKey;
  fetch('/api/lab-history?param='+encodeURIComponent(k)).then(function(r){return r.json();}).then(function(rows){rows=(rows||[]).slice().reverse();var b=document.getElementById('labGridBody');if(!rows.length){b.innerHTML='<div class="mut">No readings.</div>';return;}var dec=t.dec==null?2:t.dec,unit=t.unit||'';
-  b.innerHTML=rows.map(function(x){return '<div style="display:flex;justify-content:space-between;gap:10px;border-top:1px solid var(--line);padding:8px 0"><span class="mut">'+labTime(x.ts)+'</span><b>'+(x.value==null?'-':(+x.value).toFixed(dec))+' '+unit+'</b></div>';}).join('');}).catch(function(){});}
+  b.innerHTML=rows.map(function(x){var man=(x.account_id==='manual');
+   return '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;border-top:1px solid var(--line);padding:8px 0"><span class="mut">'+labTime(x.ts)+(man?' <span style="color:var(--primary);font-size:11px">&middot; manual</span>':'')+'</span><span style="display:flex;align-items:center;gap:10px"><b>'+(x.value==null?'-':(+x.value).toFixed(dec))+' '+unit+'</b>'+(man?('<button class="btn s" style="flex:0;padding:3px 8px;color:var(--bad)" data-id="'+x.id+'" onclick="delManual(this.dataset.id)">Delete</button>'):'')+'</span></div>';}).join('');}).catch(function(){});}
+function delManual(id){post('/api/lab-manual-delete','id='+id).then(function(r){showToast(r.message,r.ok);renderLabGrid(labTest(curGridKey)||{});load();});}
 function closeLabGrid(){document.getElementById('labGridModal').classList.remove('show');}
 
 // ---------- history charts ----------
@@ -1700,6 +1754,17 @@ function buildAlerts(){var al=computeAlerts();
 
 // ---------- misc ----------
 function labSync(){showToast('Syncing PoolLab...');post('/lab-refresh').then(function(r){showToast(r.message,r.ok);load();});}
+var MT_KEYS=['ph','fc','tc','cc','cya','alk','ch','salt'];
+function openManual(){var t=document.getElementById('mt_time');t.value=localNowStr();t.max=localNowStr();
+ MT_KEYS.forEach(function(k){document.getElementById('mt_'+k).value='';});
+ document.getElementById('manualModal').classList.add('show');}
+function closeManual(){document.getElementById('manualModal').classList.remove('show');}
+function saveManual(){var body='';var t=document.getElementById('mt_time').value;
+ if(t){var ms=new Date(t).getTime();if(ms>Date.now()){showToast('Date must be in the past.',false);return;}body='at_ms='+ms;}
+ var any=false;MT_KEYS.forEach(function(k){var v=document.getElementById('mt_'+k).value;
+  if(v!==''&&v!=null){body+=(body?'&':'')+k+'='+encodeURIComponent(v);any=true;}});
+ if(!any){showToast('Enter at least one value.',false);return;}
+ closeManual();post('/api/lab-manual',body).then(function(r){showToast(r.message,r.ok);load();});}
 function refresh(){var ptr=document.getElementById('ptr');ptr.textContent='Refreshing...';ptr.style.transform='translateY(0)';
  fetch('/poll-now',{method:'POST'}).catch(function(){}).then(function(){return load();}).then(function(){ptr.style.transform='translateY(-40px)';setTimeout(function(){ptr.textContent='\\u2193 pull to refresh';},300);});}
 var ptrStart=null;
@@ -2008,7 +2073,8 @@ def lab_latest_payload():
                       "ts": r["ts"], "operator": r["operator"], "comment": r["comment"],
                       "days_since": days_since, "cadence": cad, "overdue": overdue})
     tests.sort(key=lambda t: order.get(t["key"], 99))
-    return {"tests": tests, "configured": bool(cfg_get("LABCOM_TOKEN")),
+    # show the lab panels if PoolLab is connected OR any manual tests exist
+    return {"tests": tests, "configured": bool(cfg_get("LABCOM_TOKEN")) or bool(tests),
             "last_ok": kv_get("lab_last_ok"), "last_error": kv_get("lab_last_error"),
             "pool_name": kv_get("lab_pool_name"), "due_count": due,
             "poll_hours": kv_get("labcom_poll_hours", 1.0)}
@@ -2018,7 +2084,7 @@ def lab_history_payload(param_key, days=730):
     from datetime import timedelta
     cutoff = (datetime.now(timezone.utc).astimezone() - timedelta(days=days)).isoformat()
     with db() as c:
-        rows = c.execute("SELECT ts,value,ideal_low,ideal_high FROM lab_tests "
+        rows = c.execute("SELECT rowid AS id,ts,value,ideal_low,ideal_high,operator,account_id FROM lab_tests "
                          "WHERE param_key=? AND ts>=? AND value IS NOT NULL ORDER BY ts",
                          (param_key, cutoff)).fetchall()
     lo, hi = _lab_range(param_key, None, None)   # default band for the guide lines
@@ -2033,6 +2099,57 @@ def lab_history_payload(param_key, days=730):
 
 def lab_raw_payload():
     return kv_get("lab_last_raw") or {}
+
+
+# Manually-entered water tests (e.g. strip/kit) -- stored in lab_tests under a
+# dedicated 'manual' account so the LabCom sync never touches them.
+MANUAL_PARAMS = {
+    "ph":   ("pH", "", 2),
+    "fc":   ("Free chlorine", "mg/l", 2),
+    "tc":   ("Total chlorine", "mg/l", 2),
+    "cc":   ("Combined chlorine", "mg/l", 2),
+    "cya":  ("Cyanuric acid (CYA)", "mg/l", 0),
+    "alk":  ("Total alkalinity", "mg/l", 0),
+    "ch":   ("Calcium hardness", "mg/l", 0),
+    "salt": ("Salt", "mg/l", 0),
+}
+
+
+def add_manual_test(form):
+    """Insert one manual reading row per supplied parameter. Returns count added."""
+    at = form.get("at_ms")
+    try:
+        ts = (datetime.fromtimestamp(float(at) / 1000).astimezone().isoformat(timespec="seconds")
+              if at else now_iso())
+    except (TypeError, ValueError):
+        ts = now_iso()
+    added = 0
+    with db() as c:
+        for key, (label, unit, _dec) in MANUAL_PARAMS.items():
+            raw = form.get(key)
+            if raw is None or str(raw).strip() == "":
+                continue
+            try:
+                val = float(raw)
+            except ValueError:
+                continue
+            if abs(val) >= LAB_SENTINEL:
+                continue
+            mid = "manual-" + hashlib.md5(("%s|%s|%f" % (ts, key, time.time())).encode()).hexdigest()[:16]
+            c.execute("INSERT INTO lab_tests "
+                      "(meas_id,ts,account_id,parameter,param_key,value,unit,"
+                      " ideal_low,ideal_high,operator,comment) "
+                      "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                      (mid, ts, "manual", label, key, val, unit, -1, -1,
+                       "manual", "manual entry"))
+            added += 1
+    return added
+
+
+def delete_manual_test(row_id):
+    with db() as c:
+        cur = c.execute("DELETE FROM lab_tests WHERE rowid=? AND account_id='manual'", (row_id,))
+    return cur.rowcount
 
 
 def _pearson(xs, ys):
@@ -2594,6 +2711,17 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     kv_set("lab_last_error", f"{now_iso()}: {e}")
                     self._json({"ok": False, "message": f"LabCom sync failed: {e}"})
+            elif path == "/api/lab-manual":
+                n = add_manual_test(form)
+                self._json({"ok": bool(n), "message": (f"Saved {n} manual reading(s)." if n
+                            else "Nothing saved - enter at least one value.")})
+            elif path == "/api/lab-manual-delete":
+                try:
+                    n = delete_manual_test(int(form.get("id", "0")))
+                except (TypeError, ValueError):
+                    n = 0
+                self._json({"ok": bool(n), "message": ("Reading deleted." if n
+                            else "Could not delete (manual readings only).")})
             elif path == "/api/filter-control":
                 action = form.get("action", "")
                 try:
