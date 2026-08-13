@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.10.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.10.1"          # bump on every change; shown at bottom of Settings
 
 BASE_URL = "https://connect.klereo.fr/"
 APP_KIND, VERSION, LANG, HTTP_TIMEOUT = "Web", "3-W", "en", 30
@@ -1129,9 +1129,12 @@ PAGE = b"""<!doctype html><html lang="en"><head>
 html,body{overscroll-behavior-y:contain}
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);transition:background .3s,color .3s}
 .app{max-width:480px;margin:0 auto;min-height:100vh;padding:0 0 96px;position:relative}
-.top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:calc(env(safe-area-inset-top,0px) + 16px) 16px 4px}
+.top{display:block;padding:calc(env(safe-area-inset-top,0px) + 16px) 16px 4px}
+.top .toprow{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .top h1{font-size:21px;margin:0;letter-spacing:-.3px}
-.top .titlewrap{min-width:0}
+.top .rightwrap{display:flex;align-items:center;gap:12px;flex:0 0 auto}
+.top .nick{color:var(--muted);font-size:14px;margin-top:2px}
+.top .nick:empty{display:none}
 .top .sub{color:var(--muted);font-size:12.5px;margin-top:2px}
 /* first-paint loading overlay */
 #loader{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg);z-index:200;transition:opacity .35s}
@@ -1310,11 +1313,14 @@ a{color:var(--primary)}
 
 <div class="app">
  <div class="top">
-   <div class="titlewrap"><h1>Pool Stats <span id="nick" style="font-size:14px;color:var(--muted);font-weight:400"></span></h1>
-     <div class="sub" id="sub">loading...</div></div>
-   <div style="display:flex;align-items:center;gap:12px;flex:0 0 auto">
-     <div class="weather" id="weather"></div>
-     <button class="iconbtn" id="themeBtn" onclick="cycleTheme()" title="Theme"></button></div>
+   <div class="toprow">
+     <h1>Pool Stats</h1>
+     <div class="rightwrap">
+       <div class="weather" id="weather"></div>
+       <button class="iconbtn" id="themeBtn" onclick="cycleTheme()" title="Theme"></button></div>
+   </div>
+   <div class="nick" id="nick"></div>
+   <div class="sub" id="sub">loading...</div>
  </div>
  <div class="statusbar" id="statusbar"></div>
  <div id="errbox"></div>
@@ -1401,7 +1407,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
      <div class="grow"><span class="k">Add a manual water test</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="openManual()">Add test</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.10.0</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">Pool Stats v2.10.1</div>
  </div></div>
 
  <div class="tabbar">
