@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.11.1"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.11.2"          # bump on every change; shown at bottom of Settings
 
 # --- brand assets (H2-Oh Yeah!) ------------------------------------------------
 FAVICON_SVG = (
@@ -196,40 +196,68 @@ def init_db():
     _migrate_legacy_bottle()
 
 
-def _derive_combined_chlorine(c):
+CC_PAIR_WINDOW_H = 12.0   # max hours between a Free and Total reading to treat
+                          # them as the same test session for cc = TC - FC
+
+
+def _derive_combined_chlorine(c, window_h=CC_PAIR_WINDOW_H):
     """Combined chlorine = total chlorine - free chlorine. PoolLab doesn't always
     push a separate 'combined chlorine' row even when it measured both TC and FC,
     which leaves the cc reading (and its retest reminder) stuck on an old test.
-    For every test session (rows sharing a timestamp) that has both TC and FC but
-    no cc, synthesise a cc reading so the Balance card and cadence stay in step
-    with the FC/TC they're computed from. Derived rows are account_id='derived',
-    so the cloud-deletion mirror never touches them. Returns rows added."""
-    # A real cc for a timestamp always wins: drop any derived duplicate first.
-    c.execute("DELETE FROM lab_tests WHERE account_id='derived' AND param_key='cc' "
-              "AND ts IN (SELECT ts FROM lab_tests WHERE param_key='cc' "
-              "AND account_id<>'derived' AND value IS NOT NULL)")
+    A photometer test also stamps each cuvette a few minutes apart, so FC and TC
+    rarely share an exact timestamp -- we therefore pair each Total reading with
+    the nearest Free reading within window_h hours and, if there's no combined
+    reading nearby, synthesise one. Derived rows are account_id='derived', so the
+    cloud-deletion mirror never touches them. Returns rows added."""
+    def _dt(s):
+        try:
+            return datetime.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+
+    rows = [dict(r) for r in c.execute(
+        "SELECT rowid,ts,param_key,value,account_id,unit FROM lab_tests "
+        "WHERE value IS NOT NULL AND ts IS NOT NULL "
+        "AND param_key IN ('fc','tc','cc')").fetchall()]
+    fcs = [(r, _dt(r["ts"])) for r in rows if r["param_key"] == "fc"]
+    tcs = [(r, _dt(r["ts"])) for r in rows if r["param_key"] == "tc"]
+    ccs = [(r, _dt(r["ts"])) for r in rows if r["param_key"] == "cc"]
+    fcs = [(r, d) for (r, d) in fcs if d]
+    tcs = [(r, d) for (r, d) in tcs if d]
+    ccs = [(r, d) for (r, d) in ccs if d]
+    win = window_h * 3600.0
+
+    # A real (non-derived) cc near a derived one always wins: drop stale derived.
+    real_cc = [(r, d) for (r, d) in ccs if r["account_id"] != "derived"]
+    for (r, d) in ccs:
+        if r["account_id"] == "derived" and any(
+                abs((d - rd).total_seconds()) <= win for (_x, rd) in real_cc):
+            c.execute("DELETE FROM lab_tests WHERE rowid=?", (r["rowid"],))
+    ccs = [(r, d) for (r, d) in ccs if not (
+        r["account_id"] == "derived" and any(
+            abs((d - rd).total_seconds()) <= win for (_x, rd) in real_cc))]
+
     made = 0
-    rows = c.execute(
-        "SELECT ts,"
-        " MAX(CASE WHEN param_key='fc' THEN value END) AS fc,"
-        " MAX(CASE WHEN param_key='tc' THEN value END) AS tc,"
-        " MAX(CASE WHEN param_key='cc' THEN 1 ELSE 0 END) AS has_cc,"
-        " MAX(CASE WHEN param_key IN ('fc','tc') THEN unit END) AS unit"
-        " FROM lab_tests WHERE value IS NOT NULL AND ts IS NOT NULL "
-        "GROUP BY ts").fetchall()
-    for r in rows:
-        if r["has_cc"] or r["fc"] is None or r["tc"] is None:
-            continue
-        cc = round(max(0.0, float(r["tc"]) - float(r["fc"])), 2)
+    for (tc, td) in tcs:
+        near_fc = [(fc, fd) for (fc, fd) in fcs
+                   if abs((td - fd).total_seconds()) <= win]
+        if not near_fc:
+            continue                       # no Free reading for this session
+        fc, _fd = min(near_fc, key=lambda x: abs((td - x[1]).total_seconds()))
+        if any(abs((td - cd).total_seconds()) <= win for (_c, cd) in ccs):
+            continue                       # a cc (real or derived) already covers it
+        cc = round(max(0.0, float(tc["value"]) - float(fc["value"])), 2)
         cur = c.execute(
             "INSERT OR IGNORE INTO lab_tests "
             "(meas_id,ts,account_id,parameter,param_key,value,unit,"
             " ideal_low,ideal_high,operator,comment,device_serial) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            ("derived-cc-" + str(r["ts"]), r["ts"], "derived",
-             "Combined chlorine", "cc", cc, r["unit"] or "mg/l",
+            ("derived-cc-" + str(tc["ts"]), tc["ts"], "derived",
+             "Combined chlorine", "cc", cc, tc["unit"] or "mg/l",
              None, None, "derived", "auto = total - free chlorine", None))
         made += cur.rowcount
+        if cur.rowcount:
+            ccs.append((dict(tc, param_key="cc"), td))   # avoid double-deriving
     return made
 
 
@@ -1730,7 +1758,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
      <div class="grow"><span class="k">Add a manual water test</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="openManual()">Add test</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">H&#8322;-Oh Yeah! v2.11.1</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">H&#8322;-Oh Yeah! v2.11.2</div>
  </div></div>
 
  <div class="tabbar">
