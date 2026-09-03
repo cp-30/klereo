@@ -64,7 +64,7 @@ except ImportError:
     sys.exit("Missing dependency. Run:  pip install requests")
 
 # --------------------------------------------------------------------------
-APP_VERSION = "2.11.0"          # bump on every change; shown at bottom of Settings
+APP_VERSION = "2.11.1"          # bump on every change; shown at bottom of Settings
 
 # --- brand assets (H2-Oh Yeah!) ------------------------------------------------
 FAVICON_SVG = (
@@ -190,8 +190,47 @@ def init_db():
                       (key, pname, key))
         # drop any out-of-range 'OR' sentinel readings (1e6) stored by old versions
         c.execute("DELETE FROM lab_tests WHERE value IS NOT NULL AND ABS(value) >= 100000")
+        # backfill derived combined-chlorine for any past FC+TC sessions
+        _derive_combined_chlorine(c)
     # one-time migration: fold the old single chlorine baseline into bottles[]
     _migrate_legacy_bottle()
+
+
+def _derive_combined_chlorine(c):
+    """Combined chlorine = total chlorine - free chlorine. PoolLab doesn't always
+    push a separate 'combined chlorine' row even when it measured both TC and FC,
+    which leaves the cc reading (and its retest reminder) stuck on an old test.
+    For every test session (rows sharing a timestamp) that has both TC and FC but
+    no cc, synthesise a cc reading so the Balance card and cadence stay in step
+    with the FC/TC they're computed from. Derived rows are account_id='derived',
+    so the cloud-deletion mirror never touches them. Returns rows added."""
+    # A real cc for a timestamp always wins: drop any derived duplicate first.
+    c.execute("DELETE FROM lab_tests WHERE account_id='derived' AND param_key='cc' "
+              "AND ts IN (SELECT ts FROM lab_tests WHERE param_key='cc' "
+              "AND account_id<>'derived' AND value IS NOT NULL)")
+    made = 0
+    rows = c.execute(
+        "SELECT ts,"
+        " MAX(CASE WHEN param_key='fc' THEN value END) AS fc,"
+        " MAX(CASE WHEN param_key='tc' THEN value END) AS tc,"
+        " MAX(CASE WHEN param_key='cc' THEN 1 ELSE 0 END) AS has_cc,"
+        " MAX(CASE WHEN param_key IN ('fc','tc') THEN unit END) AS unit"
+        " FROM lab_tests WHERE value IS NOT NULL AND ts IS NOT NULL "
+        "GROUP BY ts").fetchall()
+    for r in rows:
+        if r["has_cc"] or r["fc"] is None or r["tc"] is None:
+            continue
+        cc = round(max(0.0, float(r["tc"]) - float(r["fc"])), 2)
+        cur = c.execute(
+            "INSERT OR IGNORE INTO lab_tests "
+            "(meas_id,ts,account_id,parameter,param_key,value,unit,"
+            " ideal_low,ideal_high,operator,comment,device_serial) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("derived-cc-" + str(r["ts"]), r["ts"], "derived",
+             "Combined chlorine", "cc", cc, r["unit"] or "mg/l",
+             None, None, "derived", "auto = total - free chlorine", None))
+        made += cur.rowcount
+    return made
 
 
 def _migrate_legacy_bottle():
@@ -950,6 +989,8 @@ def labcom_store(cloud):
         cur = c.execute("DELETE FROM lab_tests WHERE value IS NOT NULL AND ABS(value) >= ?",
                         (LAB_SENTINEL,))
         removed += cur.rowcount
+        # Synthesise combined chlorine (= total - free) for FC+TC-only sessions.
+        added += _derive_combined_chlorine(c)
     if removed:
         print(f"[labcom] removed {removed} stale/out-of-range lab row(s)")
     return added
@@ -2431,6 +2472,8 @@ def add_manual_test(form):
                       (mid, ts, "manual", label, key, val, unit, -1, -1,
                        "manual", "manual entry"))
             added += 1
+        # derive combined chlorine if TC and FC were entered without a cc
+        _derive_combined_chlorine(c)
     return added
 
 
