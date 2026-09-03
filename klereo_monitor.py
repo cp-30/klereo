@@ -1730,7 +1730,7 @@ a{color:var(--primary)}
      <div class="grow"><span class="k">Sync PoolLab now</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="labSync()">Sync</button></div>
      <div class="grow"><span class="k">Add a manual water test</span><button class="btn s" style="flex:0;padding:7px 12px" onclick="openManual()">Add test</button></div>
    </div>
-   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">H&#8322;-Oh Yeah! v2.11.0</div>
+   <div class="mut" style="text-align:center;font-size:12px;margin-top:6px">H&#8322;-Oh Yeah! v2.11.1</div>
  </div></div>
 
  <div class="tabbar">
